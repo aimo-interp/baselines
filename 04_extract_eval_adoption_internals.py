@@ -16,7 +16,6 @@ Example:
 from __future__ import annotations
 
 import argparse
-import os
 from pathlib import Path
 
 import numpy as np
@@ -47,13 +46,29 @@ def parse_args() -> argparse.Namespace:
         default="data/eval_adoption_internals",
         help="Directory to write metadata.csv and layer_XXX.npy files",
     )
+    parser.add_argument(
+        "--device",
+        default="auto",
+        choices=["auto", "cpu", "cuda"],
+        help="Device to run extraction on",
+    )
     return parser.parse_args()
+
+
+def resolve_device(device_arg: str) -> str:
+    if device_arg == "auto":
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    if device_arg == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("Requested --device cuda, but CUDA is not available.")
+    return device_arg
 
 
 def main() -> None:
     args = parse_args()
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    device = resolve_device(args.device)
+    dtype = torch.bfloat16 if device == "cuda" else torch.float32
 
     system_prompt = Path(SYSTEM_PROMPT_PATH).read_text().strip()
     df = pd.read_csv(args.dataset_csv).reset_index(drop=True)
@@ -61,8 +76,10 @@ def main() -> None:
     df["absolute_accuracy_decay"] = df["absolute_accuracy_decay"].astype(float)
 
     print(f"Loading model: {args.model_id}")
+    print(f"Using device: {device} | dtype: {dtype}")
     tokenizer = AutoTokenizer.from_pretrained(args.model_id)
-    model = AutoModelForCausalLM.from_pretrained(args.model_id, torch_dtype=torch.float32)
+    model = AutoModelForCausalLM.from_pretrained(args.model_id, torch_dtype=dtype)
+    model.to(device)
     model.eval()
 
     instances = [
