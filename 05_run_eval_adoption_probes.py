@@ -13,6 +13,10 @@ The regression target is `absolute_accuracy_decay`.
 task. We therefore keep it in the probe name and dataset row identifiers, while
 running Holmes control-task variants (`NONE`, `RANDOMIZATION`, `PERMUTATION`)
 explicitly as a separate sweep dimension.
+
+Dimensionality reduction is optional. When enabled, each split is projected into
+a lower-dimensional PCA space fit on the training vectors only. This reduces
+hidden states while preserving as much geometry/variance as possible.
 """
 
 from __future__ import annotations
@@ -27,6 +31,7 @@ import numpy as np
 import pandas as pd
 import torch
 from sklearn.model_selection import train_test_split
+from sklearn.decomposition import PCA
 
 HOLMES_CORE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "holmes-evaluation", "core")
 if HOLMES_CORE not in sys.path:
@@ -37,6 +42,7 @@ from utilities.data_loading import ProbingDataset  # noqa: E402
 
 SEED = 42
 CONTROL_TASKS = ["NONE", "RANDOMIZATION", "PERMUTATION"]
+DEFAULT_REDUCED_DIM = 0
 
 
 def parse_args() -> argparse.Namespace:
@@ -56,6 +62,12 @@ def parse_args() -> argparse.Namespace:
         default="eval-adoption-probe",
         help="Name recorded in Holmes run metadata",
     )
+    parser.add_argument(
+        "--reduced-dim",
+        type=int,
+        default=DEFAULT_REDUCED_DIM,
+        help="Project hidden states to this many PCA dimensions before probing. Use 0 to disable.",
+    )
     return parser.parse_args()
 
 
@@ -69,6 +81,7 @@ def make_split(
     row_ids: list[int],
     permutation_type: str,
     control_task: str,
+    reduced_dim: int,
 ) -> tuple[ProbingDataset, ProbingDataset, ProbingDataset]:
     indices = np.arange(len(labels))
 
@@ -88,7 +101,28 @@ def make_split(
 
     rng = random.Random(SEED)
 
-    def make_dataset(idx: np.ndarray) -> ProbingDataset:
+    def maybe_reduce(
+        train_vecs: np.ndarray,
+        dev_vecs: np.ndarray,
+        test_vecs: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        if reduced_dim <= 0:
+            return train_vecs, dev_vecs, test_vecs
+
+        n_components = min(reduced_dim, train_vecs.shape[0], train_vecs.shape[1])
+        if n_components < 1:
+            raise ValueError(
+                f"Cannot fit PCA for permutation_type={permutation_type!r}: "
+                f"train shape={train_vecs.shape}"
+            )
+
+        pca = PCA(n_components=n_components, svd_solver="full", random_state=SEED)
+        train_reduced = pca.fit_transform(train_vecs)
+        dev_reduced = pca.transform(dev_vecs)
+        test_reduced = pca.transform(test_vecs)
+        return train_reduced.astype(np.float32), dev_reduced.astype(np.float32), test_reduced.astype(np.float32)
+
+    def prepare_vectors(idx: np.ndarray) -> tuple[np.ndarray, list[float]]:
         idx = np.asarray(idx)
         vecs = hidden_states[idx]
         lbls = labels[idx].astype(float).tolist()
@@ -98,13 +132,22 @@ def make_split(
             shuffled = list(range(len(idx)))
             rng.shuffle(shuffled)
             vecs = vecs[shuffled]
-        inputs = to_inputs([row_ids[i] for i in idx.tolist()], permutation_type)
+        return vecs, lbls
+
+    train_vecs, train_lbls = prepare_vectors(train_idx)
+    dev_vecs, dev_lbls = prepare_vectors(dev_idx)
+    test_vecs, test_lbls = prepare_vectors(test_idx)
+
+    train_vecs, dev_vecs, test_vecs = maybe_reduce(train_vecs, dev_vecs, test_vecs)
+
+    def make_dataset_from_arrays(idx: np.ndarray, vecs: np.ndarray, lbls: list[float]) -> ProbingDataset:
+        inputs = to_inputs([row_ids[i] for i in np.asarray(idx).tolist()], permutation_type)
         encoded = list(vecs)
         return ProbingDataset(inputs, encoded, lbls)
 
-    train_ds = make_dataset(train_idx)
-    dev_ds = make_dataset(dev_idx)
-    test_ds = make_dataset(test_idx)
+    train_ds = make_dataset_from_arrays(train_idx, train_vecs, train_lbls)
+    dev_ds = make_dataset_from_arrays(dev_idx, dev_vecs, dev_lbls)
+    test_ds = make_dataset_from_arrays(test_idx, test_vecs, test_lbls)
 
     dev_ds.update_seen(train_ds.unique_inputs)
     test_ds.update_seen(train_ds.unique_inputs)
@@ -119,6 +162,7 @@ def run_layer(
     row_ids: list[int],
     permutation_type: str,
     control_task: str,
+    reduced_dim: int,
     n_total_layers: int,
     results_dir: str,
     model_name: str,
@@ -129,8 +173,9 @@ def run_layer(
         row_ids,
         permutation_type,
         control_task,
+        reduced_dim,
     )
-    hidden_dim = int(hidden_states.shape[1])
+    hidden_dim = int(np.asarray(train_ds.inputs_encoded[0]).shape[0])
     probe_name = (
         f"absolute_accuracy_decay__{permutation_type}__"
         f"{control_task.lower()}__L{layer_idx:03d}"
@@ -138,7 +183,7 @@ def run_layer(
 
     print(
         f"  {permutation_type:>9} | {control_task:>13} | "
-        f"layer {layer_idx:03d} | n={len(labels)}"
+        f"layer {layer_idx:03d} | n={len(labels)} | d={hidden_dim}"
     )
     worker = GeneralProbeWorker(
         hyperparameter={
@@ -212,6 +257,7 @@ def main() -> None:
                     row_ids=row_ids,
                     permutation_type=permutation_type,
                     control_task=control_task,
+                    reduced_dim=args.reduced_dim,
                     n_total_layers=n_layers,
                     results_dir=args.results_dir,
                     model_name=args.model_name,
