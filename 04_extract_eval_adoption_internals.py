@@ -23,9 +23,6 @@ import pandas as pd
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-import lamina
-from lamina import InternalsDataset, InternalsInstance
-
 SYSTEM_PROMPT_PATH = "prompts/solve.txt"
 
 
@@ -63,6 +60,22 @@ def resolve_device(device_arg: str) -> str:
     return device_arg
 
 
+def build_prompt(tokenizer, user_text: str, system_prompt: str) -> str:
+    if hasattr(tokenizer, "apply_chat_template"):
+        try:
+            return tokenizer.apply_chat_template(
+                [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_text},
+                ],
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+        except Exception:
+            pass
+    return f"{system_prompt}\n\n{user_text}"
+
+
 def main() -> None:
     args = parse_args()
     output_dir = Path(args.output_dir)
@@ -82,53 +95,66 @@ def main() -> None:
     model.to(device)
     model.eval()
 
-    instances = [
-        InternalsInstance(
-            text=row["original_problem"],
-            properties={
+    layer_storage: list[list[np.ndarray]] | None = None
+    n_layers: int | None = None
+    hidden_dim: int | None = None
+    metadata_rows: list[dict] = []
+
+    print(f"Extracting internals for {len(df)} rows ...")
+    for idx, row in df.iterrows():
+        print(
+            f"  [{idx + 1:>{len(str(len(df)))}}/{len(df)}]  "
+            f"row_id={int(row['row_id'])}, problem_id={row['problem_id']!r}, model_id={row['model_id']!r}"
+        )
+        prompt = build_prompt(tokenizer, row["original_problem"], system_prompt)
+        enc = tokenizer(prompt, return_tensors="pt", truncation=True)
+        enc = {k: v.to(device) for k, v in enc.items()}
+
+        with torch.no_grad():
+            output = model(
+                **enc,
+                output_hidden_states=True,
+                return_dict=True,
+                use_cache=False,
+            )
+
+        hidden_states = output.hidden_states
+        if hidden_states is None:
+            raise RuntimeError(
+                "Model forward pass returned no hidden states. "
+                "Try a newer transformers version or a different model configuration."
+            )
+
+        if layer_storage is None:
+            n_layers = len(hidden_states)
+            hidden_dim = hidden_states[0].shape[-1]
+            layer_storage = [[] for _ in range(n_layers)]
+            print(f"Layers: {n_layers}  |  hidden_dim: {hidden_dim}")
+
+        for layer_idx, hs in enumerate(hidden_states):
+            vec = hs[0, -1, :].detach().float().cpu().numpy()
+            layer_storage[layer_idx].append(vec)
+
+        metadata_rows.append(
+            {
                 "row_id": int(row["row_id"]),
                 "problem_id": row["problem_id"],
                 "model_id": row["model_id"],
                 "dataset_id": row["dataset_id"],
                 "permutation_type": row["permutation_type"],
                 "absolute_accuracy_decay": float(row["absolute_accuracy_decay"]),
-            },
-            system_prompt=system_prompt,
-        )
-        for _, row in df.iterrows()
-    ]
-    dataset = InternalsDataset(instances)
-
-    print(f"Extracting internals for {len(instances)} rows ...")
-    records = dataset.run(model, tokenizer, generate_kwargs={"max_new_tokens": 1})
-
-    n_layers = records[0].run.num_layers
-    hidden_dim = records[0].run.input_hidden_states[0].shape[-1]
-    print(f"Layers: {n_layers}  |  hidden_dim: {hidden_dim}")
-
-    for layer_idx in range(n_layers):
-        layer_vecs = np.stack(
-            [rec.run.input_hidden_states[layer_idx][0, -1, :] for rec in records]
-        )
-        np.save(output_dir / f"layer_{layer_idx:03d}.npy", layer_vecs)
-
-    metadata = pd.DataFrame(
-        [
-            {
-                "row_id": rec.properties["row_id"],
-                "problem_id": rec.properties["problem_id"],
-                "model_id": rec.properties["model_id"],
-                "dataset_id": rec.properties["dataset_id"],
-                "permutation_type": rec.properties["permutation_type"],
-                "absolute_accuracy_decay": rec.properties["absolute_accuracy_decay"],
-                "original_problem": rec.instance.text,
+                "original_problem": row["original_problem"],
             }
-            for rec in records
-        ]
-    ).sort_values("row_id")
+        )
+
+    assert layer_storage is not None
+    for layer_idx, rows in enumerate(layer_storage):
+        np.save(output_dir / f"layer_{layer_idx:03d}.npy", np.stack(rows))
+
+    metadata = pd.DataFrame(metadata_rows).sort_values("row_id")
     metadata.to_csv(output_dir / "metadata.csv", index=False)
 
-    print(f"Saved metadata and {n_layers} layer files to {output_dir}")
+    print(f"Saved metadata and {len(layer_storage)} layer files to {output_dir}")
 
 
 if __name__ == "__main__":
