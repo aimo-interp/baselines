@@ -4,16 +4,22 @@ Run regression probes on eval-adoption internals.
 For each `permutation_type`, this script:
 1. creates an outer 80:20 train/test split,
 2. carves a validation split out of the training pool for early stopping,
-3. trains one linear regression probe per transformer layer,
+3. trains one linear regression probe per transformer layer and control setup,
 4. writes results via the Holmes CSV logger.
 
 The regression target is `absolute_accuracy_decay`.
+
+`permutation_type` is an eval-adoption perturbation label, not a Holmes control
+task. We therefore keep it in the probe name and dataset row identifiers, while
+running Holmes control-task variants (`NONE`, `RANDOMIZATION`, `PERMUTATION`)
+explicitly as a separate sweep dimension.
 """
 
 from __future__ import annotations
 
 import argparse
 import os
+import random
 import sys
 from pathlib import Path
 
@@ -30,6 +36,7 @@ from probing_worker import GeneralProbeWorker  # noqa: E402
 from utilities.data_loading import ProbingDataset  # noqa: E402
 
 SEED = 42
+CONTROL_TASKS = ["NONE", "RANDOMIZATION", "PERMUTATION"]
 
 
 def parse_args() -> argparse.Namespace:
@@ -61,6 +68,7 @@ def make_split(
     labels: np.ndarray,
     row_ids: list[int],
     permutation_type: str,
+    control_task: str,
 ) -> tuple[ProbingDataset, ProbingDataset, ProbingDataset]:
     indices = np.arange(len(labels))
 
@@ -78,10 +86,18 @@ def make_split(
         random_state=SEED,
     )
 
+    rng = random.Random(SEED)
+
     def make_dataset(idx: np.ndarray) -> ProbingDataset:
         idx = np.asarray(idx)
         vecs = hidden_states[idx]
         lbls = labels[idx].astype(float).tolist()
+        if control_task == "RANDOMIZATION":
+            rng.shuffle(lbls)
+        elif control_task == "PERMUTATION":
+            shuffled = list(range(len(idx)))
+            rng.shuffle(shuffled)
+            vecs = vecs[shuffled]
         inputs = to_inputs([row_ids[i] for i in idx.tolist()], permutation_type)
         encoded = list(vecs)
         return ProbingDataset(inputs, encoded, lbls)
@@ -102,15 +118,28 @@ def run_layer(
     labels: np.ndarray,
     row_ids: list[int],
     permutation_type: str,
+    control_task: str,
     n_total_layers: int,
     results_dir: str,
     model_name: str,
 ) -> None:
-    train_ds, dev_ds, test_ds = make_split(hidden_states, labels, row_ids, permutation_type)
+    train_ds, dev_ds, test_ds = make_split(
+        hidden_states,
+        labels,
+        row_ids,
+        permutation_type,
+        control_task,
+    )
     hidden_dim = int(hidden_states.shape[1])
-    probe_name = f"absolute_accuracy_decay__{permutation_type}__L{layer_idx:03d}"
+    probe_name = (
+        f"absolute_accuracy_decay__{permutation_type}__"
+        f"{control_task.lower()}__L{layer_idx:03d}"
+    )
 
-    print(f"  {permutation_type:>9} | layer {layer_idx:03d} | n={len(labels)}")
+    print(
+        f"  {permutation_type:>9} | {control_task:>13} | "
+        f"layer {layer_idx:03d} | n={len(labels)}"
+    )
     worker = GeneralProbeWorker(
         hyperparameter={
             "seed": SEED,
@@ -127,7 +156,7 @@ def run_layer(
             "optimizer": torch.optim.Adam,
             "probe_task_type": "SENTENCE",
             "model_name": model_name,
-            "control_task_type": permutation_type.upper(),
+            "control_task_type": control_task,
             "sample_size": 0,
         },
         train_dataset=train_ds,
@@ -158,7 +187,11 @@ def main() -> None:
         if f.name.startswith("layer_") and f.suffix == ".npy"
     )
     n_layers = len(layer_files)
-    print(f"Probing {n_layers} layers across {metadata['permutation_type'].nunique()} permutation types")
+    print(
+        f"Probing {n_layers} layers across "
+        f"{metadata['permutation_type'].nunique()} permutation types and "
+        f"{len(CONTROL_TASKS)} control settings"
+    )
 
     for permutation_type, subset in metadata.groupby("permutation_type", sort=True):
         subset = subset.reset_index(drop=True)
@@ -171,16 +204,18 @@ def main() -> None:
             layer_idx = int(layer_file.replace("layer_", "").replace(".npy", ""))
             layer_states = np.load(internals_dir / layer_file)
             subset_states = layer_states[subset_indices]
-            run_layer(
-                layer_idx=layer_idx,
-                hidden_states=subset_states,
-                labels=labels,
-                row_ids=row_ids,
-                permutation_type=permutation_type,
-                n_total_layers=n_layers,
-                results_dir=args.results_dir,
-                model_name=args.model_name,
-            )
+            for control_task in CONTROL_TASKS:
+                run_layer(
+                    layer_idx=layer_idx,
+                    hidden_states=subset_states,
+                    labels=labels,
+                    row_ids=row_ids,
+                    permutation_type=permutation_type,
+                    control_task=control_task,
+                    n_total_layers=n_layers,
+                    results_dir=args.results_dir,
+                    model_name=args.model_name,
+                )
 
     print(f"\nDone. Results saved to {args.results_dir}/")
 
