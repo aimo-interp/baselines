@@ -103,13 +103,7 @@ def build_instances(df: pd.DataFrame, system_prompt: str) -> list[InternalsInsta
         InternalsInstance(
             text=row["original_problem"],
             properties={
-                "row_id": int(row["row_id"]),
-                "problem_id": row["problem_id"],
-                "model_id": row["model_id"],
-                "dataset_id": row["dataset_id"],
-                "permutation_type": row["permutation_type"],
-                "absolute_accuracy_decay": float(row["absolute_accuracy_decay"]),
-                "original_problem": row["original_problem"],
+                "prompt_key": row["original_problem"],
                 **{
                     col: row[col]
                     for col in OPTIONAL_METADATA_COLUMNS
@@ -164,15 +158,16 @@ def extract_view_vector(record, view: str, layer_idx: int) -> np.ndarray:
     raise ValueError(f"Unknown extraction view: {view}")
 
 
-def save_view(
-    records: list,
+def save_view_from_cache(
+    record_cache: dict[str, object],
+    prompt_keys: list[str],
     metadata_rows: list[dict],
     output_dir: Path,
     view: str,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    first_run = records[0].run
+    first_run = next(iter(record_cache.values())).run
     if view == "input_last_token":
         source = first_run.input_hidden_states
     elif view in {"last_thinking_token", "output_last_token"}:
@@ -186,8 +181,8 @@ def save_view(
     n_layers = len(source)
     for layer_idx in range(n_layers):
         layer_vecs = np.stack([
-            extract_view_vector(record, view, layer_idx)
-            for record in records
+            extract_view_vector(record_cache[prompt_key], view, layer_idx)
+            for prompt_key in prompt_keys
         ])
         np.save(output_dir / f"layer_{layer_idx:03d}.npy", layer_vecs)
 
@@ -204,11 +199,17 @@ def save_fast_input_last_token_view(
 ) -> None:
     layer_storage: list[list[np.ndarray]] | None = None
     metadata_rows: list[dict] = []
+    prompt_cache: dict[str, list[np.ndarray]] = {}
+    prompt_keys = df["original_problem"].tolist()
+    unique_rows = df.drop_duplicates(subset=["original_problem"], keep="first").reset_index(drop=True)
 
-    print(f"Extracting fast input_last_token internals for {len(df)} rows ...")
-    for idx, row in df.iterrows():
+    print(
+        f"Extracting fast input_last_token internals for {len(df)} rows "
+        f"({len(unique_rows)} unique prompts) ..."
+    )
+    for idx, row in unique_rows.iterrows():
         print(
-            f"  [{idx + 1:>{len(str(len(df)))}}/{len(df)}]  "
+            f"  [{idx + 1:>{len(str(len(unique_rows)))}}/{len(unique_rows)}]  "
             f"row_id={int(row['row_id'])}, problem_id={row['problem_id']!r}, model_id={row['model_id']!r}"
         )
         prompt = build_prompt(tokenizer, row["original_problem"], system_prompt)
@@ -233,8 +234,17 @@ def save_fast_input_last_token_view(
             layer_storage = [[] for _ in range(n_layers)]
             print(f"Fast path layers: {n_layers} | hidden_dim: {hidden_dim}")
 
-        for layer_idx, hs in enumerate(hidden_states):
-            vec = hs[0, -1, :].detach().float().cpu().numpy()
+        prompt_cache[row["original_problem"]] = [
+            hs[0, -1, :].detach().float().cpu().numpy()
+            for hs in hidden_states
+        ]
+
+    if layer_storage is None:
+        raise RuntimeError("No hidden states were extracted on the fast input path.")
+
+    for idx, row in df.iterrows():
+        for layer_idx in range(len(layer_storage)):
+            vec = prompt_cache[row["original_problem"]][layer_idx]
             layer_storage[layer_idx].append(vec)
 
         metadata_rows.append(
@@ -254,9 +264,6 @@ def save_fast_input_last_token_view(
                 },
             }
         )
-
-    if layer_storage is None:
-        raise RuntimeError("No hidden states were extracted on the fast input path.")
 
     output_dir.mkdir(parents=True, exist_ok=True)
     for layer_idx, rows in enumerate(layer_storage):
@@ -280,6 +287,7 @@ def main() -> None:
     df = pd.read_csv(args.dataset_csv).reset_index(drop=True)
     df["row_id"] = df.index
     df["absolute_accuracy_decay"] = df["absolute_accuracy_decay"].astype(float)
+    prompt_keys = df["original_problem"].tolist()
 
     print(f"Loading model: {args.model_id}")
     print(f"Using device: {device} | dtype: {dtype}")
@@ -302,10 +310,11 @@ def main() -> None:
         )
         return
 
-    instances = build_instances(df, system_prompt)
+    unique_df = df.drop_duplicates(subset=["original_problem"], keep="first").reset_index(drop=True)
+    instances = build_instances(unique_df, system_prompt)
     dataset = InternalsDataset(instances)
 
-    print(f"Extracting internals for {len(instances)} rows ...")
+    print(f"Extracting internals for {len(df)} rows ({len(instances)} unique prompts) ...")
     records = dataset.run(
         model,
         tokenizer,
@@ -314,6 +323,11 @@ def main() -> None:
     )
     if not records:
         raise RuntimeError("Lamina returned no records.")
+
+    record_cache = {
+        str(record.properties["prompt_key"]): record
+        for record in records
+    }
 
     first_run = records[0].run
     input_layers = len(first_run.input_hidden_states or [])
@@ -329,20 +343,20 @@ def main() -> None:
 
     base_metadata_rows = [
         {
-            "row_id": int(record.properties["row_id"]),
-            "problem_id": record.properties["problem_id"],
-            "model_id": record.properties["model_id"],
-            "dataset_id": record.properties["dataset_id"],
-            "permutation_type": record.properties["permutation_type"],
-            "absolute_accuracy_decay": float(record.properties["absolute_accuracy_decay"]),
-            "original_problem": record.properties["original_problem"],
+            "row_id": int(row["row_id"]),
+            "problem_id": row["problem_id"],
+            "model_id": row["model_id"],
+            "dataset_id": row["dataset_id"],
+            "permutation_type": row["permutation_type"],
+            "absolute_accuracy_decay": float(row["absolute_accuracy_decay"]),
+            "original_problem": row["original_problem"],
             **{
-                col: record.properties[col]
+                col: row[col]
                 for col in OPTIONAL_METADATA_COLUMNS
-                if col in record.properties
+                if col in row and pd.notna(row[col])
             },
         }
-        for record in records
+        for _, row in df.iterrows()
     ]
 
     for view in views:
@@ -351,7 +365,13 @@ def main() -> None:
             {**row, "extraction_view": view}
             for row in base_metadata_rows
         ]
-        save_view(records, view_metadata_rows, view_output_dir(base_output_dir, view), view)
+        save_view_from_cache(
+            record_cache,
+            prompt_keys,
+            view_metadata_rows,
+            view_output_dir(base_output_dir, view),
+            view,
+        )
 
     print(
         "Saved view directories: "
