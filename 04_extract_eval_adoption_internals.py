@@ -178,7 +178,10 @@ def main() -> None:
     base_output_dir = Path(args.output_dir)
     views = parse_views(args.views)
     device = resolve_device(args.device)
-    dtype = torch.bfloat16 if device == "cuda" else torch.float32
+    # Lamina's worker converts captured tensors through NumPy. On many setups,
+    # direct NumPy conversion for bfloat16 tensors fails, so prefer float16 on
+    # CUDA here and keep float32 on CPU.
+    dtype = torch.float16 if device == "cuda" else torch.float32
 
     system_prompt = Path(SYSTEM_PROMPT_PATH).read_text().strip()
     df = pd.read_csv(args.dataset_csv).reset_index(drop=True)
