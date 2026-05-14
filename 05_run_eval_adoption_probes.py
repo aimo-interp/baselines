@@ -1,5 +1,5 @@
 """
-Run regression probes on eval-adoption internals.
+Run eval-adoption probes in regression or classification mode.
 
 For each `permutation_type`, this script:
 1. runs a repeated K-fold evaluation across configurable seeds and folds,
@@ -8,7 +8,8 @@ For each `permutation_type`, this script:
 4. optionally evaluates the trained probe on an additional OOD internals set,
 5. writes results via the Holmes CSV logger.
 
-The regression target is `absolute_accuracy_decay`.
+The default regression target is `absolute_accuracy_decay`, but the script can
+also run classification probes, e.g. against `is_robust`.
 
 `permutation_type` is an eval-adoption perturbation label, not a Holmes control
 task. We therefore keep it in the probe name and dataset row identifiers, while
@@ -23,7 +24,9 @@ hidden states while preserving as much geometry/variance as possible.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
+import multiprocessing
 import os
 import random
 import sys
@@ -33,7 +36,8 @@ import numpy as np
 import pandas as pd
 import torch
 from sklearn.decomposition import PCA
-from sklearn.model_selection import KFold, train_test_split
+from sklearn.metrics import accuracy_score, f1_score, mean_squared_error
+from sklearn.model_selection import KFold, StratifiedKFold, train_test_split
 
 HOLMES_CORE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "holmes-evaluation", "core")
 if HOLMES_CORE not in sys.path:
@@ -47,6 +51,8 @@ DEFAULT_REDUCED_DIM = 0
 DEFAULT_SEEDS = [42, 43, 44, 45, 46]
 DEFAULT_NUM_FOLDS = 4
 DEFAULT_DEV_FRACTION = 0.20
+DEFAULT_TARGET_COL = "absolute_accuracy_decay"
+DEFAULT_TASK_TYPE = "regression"
 
 
 def parse_args() -> argparse.Namespace:
@@ -94,6 +100,23 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="Optional directory containing a second metadata.csv plus layer_XXX.npy files used as an additional OOD test set.",
     )
+    parser.add_argument(
+        "--target-col",
+        default=DEFAULT_TARGET_COL,
+        help="Metadata column used as the probe target, e.g. absolute_accuracy_decay or is_robust.",
+    )
+    parser.add_argument(
+        "--task-type",
+        default=DEFAULT_TASK_TYPE,
+        choices=["regression", "classification"],
+        help="Whether to run regression or classification probes.",
+    )
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=1,
+        help="Number of parallel worker processes. Each worker handles one permutation/layer/seed/fold/control task.",
+    )
     return parser.parse_args()
 
 
@@ -117,7 +140,6 @@ def to_inputs(
 
 def load_internals(internals_dir: Path) -> tuple[pd.DataFrame, list[str]]:
     metadata = pd.read_csv(internals_dir / "metadata.csv").sort_values("row_id").reset_index(drop=True)
-    metadata["absolute_accuracy_decay"] = metadata["absolute_accuracy_decay"].astype(float)
     layer_files = sorted(
         f.name
         for f in internals_dir.iterdir()
@@ -134,11 +156,11 @@ def apply_control(
 ) -> tuple[np.ndarray, np.ndarray]:
     rng = random.Random(seed)
     vecs = np.asarray(vecs)
-    lbls = np.asarray(lbls, dtype=np.float32)
+    lbls = np.asarray(lbls)
     if control_task == "RANDOMIZATION":
         shuffled_labels = lbls.tolist()
         rng.shuffle(shuffled_labels)
-        return vecs, np.asarray(shuffled_labels, dtype=np.float32)
+        return vecs, np.asarray(shuffled_labels, dtype=lbls.dtype)
     if control_task == "PERMUTATION":
         shuffled = list(range(len(vecs)))
         rng.shuffle(shuffled)
@@ -182,7 +204,7 @@ def build_dataset(
 ) -> ProbingDataset:
     inputs = to_inputs(row_ids, permutation_type, prefix=prefix)
     encoded = list(np.asarray(vecs, dtype=np.float32))
-    return ProbingDataset(inputs, encoded, np.asarray(lbls, dtype=np.float32).tolist())
+    return ProbingDataset(inputs, encoded, np.asarray(lbls).tolist())
 
 
 def make_fold_datasets(
@@ -192,6 +214,7 @@ def make_fold_datasets(
     permutation_type: str,
     control_task: str,
     reduced_dim: int,
+    task_type: str,
     train_pool_idx: np.ndarray,
     test_idx: np.ndarray,
     dev_fraction: float,
@@ -211,10 +234,18 @@ def make_fold_datasets(
     dev_count = max(1, round(len(train_pool_idx) * dev_fraction))
     dev_count = min(dev_count, len(train_pool_idx) - 1)
     dev_fraction_of_train = dev_count / len(train_pool_idx)
+    train_pool_labels = labels[train_pool_idx]
+    dev_stratify = None
+    if task_type == "classification":
+        _, counts = np.unique(train_pool_labels, return_counts=True)
+        if np.all(counts >= 2):
+            dev_stratify = train_pool_labels
+
     train_idx, dev_idx = train_test_split(
         train_pool_idx,
         test_size=dev_fraction_of_train,
         random_state=seed,
+        stratify=dev_stratify,
     )
 
     train_vecs, train_lbls = apply_control(hidden_states[train_idx], labels[train_idx], control_task, seed)
@@ -325,6 +356,66 @@ def evaluate_regression_dataset(
     return prediction_frame, metrics
 
 
+def evaluate_dataset(
+    probing_model: torch.nn.Module,
+    dataset: ProbingDataset,
+    task_type: str,
+) -> tuple[pd.DataFrame, dict[str, float]]:
+    if task_type == "regression":
+        return evaluate_regression_dataset(probing_model, dataset)
+
+    dataloader = probing_model.get_test_dataloader(dataset, 300, shuffle=False)
+    all_probs: list[np.ndarray] = []
+    all_pred_labels: list[np.ndarray] = []
+    all_labels: list[np.ndarray] = []
+    all_losses: list[np.ndarray] = []
+    all_seen: list[np.ndarray] = []
+
+    probing_model.eval()
+    with torch.no_grad():
+        for x, y, seen_indices in dataloader:
+            x = x.to(probing_model.device)
+            y = y.to(probing_model.device)
+            probs = probing_model(x)
+            probs = torch.nn.Softmax(dim=1)(probs)
+            pred_labels = probs.argmax(dim=1)
+            losses = probing_model.loss(probs, y).detach().cpu().numpy()
+            all_probs.append(probs.detach().cpu().double().numpy())
+            all_pred_labels.append(pred_labels.detach().cpu().numpy())
+            all_labels.append(y.detach().cpu().numpy())
+            all_losses.append(losses)
+            all_seen.append(seen_indices.detach().cpu().numpy())
+
+    probs = np.concatenate(all_probs) if all_probs else np.empty((0, 2), dtype=np.float64)
+    pred_labels = np.concatenate(all_pred_labels) if all_pred_labels else np.array([], dtype=np.int64)
+    labels = np.concatenate(all_labels) if all_labels else np.array([], dtype=np.int64)
+    losses = np.concatenate(all_losses) if all_losses else np.array([], dtype=np.float64)
+    seen = np.concatenate(all_seen) if all_seen else np.array([], dtype=bool)
+
+    instances = [instance_input for instance_input in dataset.inputs]
+    prediction_frame = pd.DataFrame(
+        {
+            "instance": instances,
+            "pred": pred_labels,
+            "label": labels,
+            "loss": losses,
+            "seen": np.where(seen, "seen", "ood"),
+        }
+    )
+    if probs.size:
+        prediction_frame["prob_1"] = probs[:, 1] if probs.shape[1] > 1 else probs[:, 0]
+
+    if len(pred_labels) == 0:
+        metrics = {"ood test acc": np.nan, "ood test f1": np.nan}
+    else:
+        metrics = {
+            "ood test acc": float(accuracy_score(labels, pred_labels)),
+            "ood test f1": float(f1_score(labels, pred_labels, average="macro")),
+        }
+
+    return prediction_frame, metrics
+
+
 def run_layer(
     layer_idx: int,
     hidden_states: np.ndarray,
@@ -333,6 +424,9 @@ def run_layer(
     permutation_type: str,
     control_task: str,
     reduced_dim: int,
+    target_col: str,
+    task_type: str,
+    num_labels: int,
     seed: int,
     fold_idx: int,
     train_pool_idx: np.ndarray,
@@ -352,6 +446,7 @@ def run_layer(
         permutation_type,
         control_task,
         reduced_dim,
+        task_type,
         train_pool_idx=train_pool_idx,
         test_idx=test_idx,
         dev_fraction=dev_fraction,
@@ -362,7 +457,7 @@ def run_layer(
     )
     hidden_dim = int(np.asarray(train_ds.inputs_encoded[0]).shape[0])
     probe_name = (
-        f"absolute_accuracy_decay__{permutation_type}__"
+        f"{target_col}__{permutation_type}__"
         f"{control_task.lower()}__L{layer_idx:03d}"
     )
 
@@ -375,7 +470,7 @@ def run_layer(
             "seed": seed,
             "encoding": "full",
             "batch_size": 8,
-            "num_labels": 1,
+            "num_labels": num_labels,
             "num_hidden_layers": 0,
             "input_dim": hidden_dim,
             "output_dim": hidden_dim,
@@ -404,10 +499,53 @@ def run_layer(
     result_log_dir, _, probing_model = run_worker(worker)
 
     if ood_ds is not None and probing_model is not None:
-        ood_preds, ood_metrics = evaluate_regression_dataset(probing_model, ood_ds)
+        ood_preds, ood_metrics = evaluate_dataset(probing_model, ood_ds, task_type)
         ood_preds.to_csv(f"{result_log_dir}/ood_preds.csv")
         with open(f"{result_log_dir}/ood_metrics.json", "w", encoding="utf-8") as f:
             json.dump(ood_metrics, f, indent=2)
+
+
+def run_probe_task(task: dict) -> dict:
+    layer_states = np.load(task["internals_dir"] / task["layer_file"])
+    subset_states = layer_states[task["subset_indices"]]
+
+    ood_layer_states = ood_labels = ood_row_ids = None
+    if task["ood_internals_dir"] is not None and task["ood_indices"] is not None and len(task["ood_indices"]) > 0:
+        full_ood_states = np.load(task["ood_internals_dir"] / task["layer_file"])
+        ood_layer_states = full_ood_states[task["ood_indices"]]
+        ood_labels = task["ood_labels"]
+        ood_row_ids = task["ood_row_ids"]
+
+    run_layer(
+        layer_idx=task["layer_idx"],
+        hidden_states=subset_states,
+        labels=task["labels"],
+        row_ids=task["row_ids"],
+        permutation_type=task["permutation_type"],
+        control_task=task["control_task"],
+        reduced_dim=task["reduced_dim"],
+        target_col=task["target_col"],
+        task_type=task["task_type"],
+        num_labels=task["num_labels"],
+        seed=task["seed"],
+        fold_idx=task["fold_idx"],
+        train_pool_idx=task["train_pool_idx"],
+        test_idx=task["test_idx"],
+        dev_fraction=task["dev_fraction"],
+        n_total_layers=task["n_total_layers"],
+        results_dir=task["results_dir"],
+        model_name=task["model_name"],
+        ood_hidden_states=ood_layer_states,
+        ood_labels=ood_labels,
+        ood_row_ids=ood_row_ids,
+    )
+    return {
+        "permutation_type": task["permutation_type"],
+        "layer_idx": task["layer_idx"],
+        "seed": task["seed"],
+        "fold_idx": task["fold_idx"],
+        "control_task": task["control_task"],
+    }
 
 
 def main() -> None:
@@ -417,24 +555,55 @@ def main() -> None:
 
     seeds = parse_seeds(args.seeds)
     metadata, layer_files = load_internals(internals_dir)
+    if args.target_col not in metadata.columns:
+        raise ValueError(
+            f"Target column {args.target_col!r} not found in {internals_dir / 'metadata.csv'}"
+        )
     n_layers = len(layer_files)
     ood_metadata = None
     if args.ood_internals_dir:
         ood_metadata, ood_layer_files = load_internals(Path(args.ood_internals_dir))
         if layer_files != ood_layer_files:
             raise ValueError("OOD internals dir must contain the same layer_XXX.npy files as the main internals dir")
+        if args.target_col not in ood_metadata.columns:
+            raise ValueError(
+                f"Target column {args.target_col!r} not found in {Path(args.ood_internals_dir) / 'metadata.csv'}"
+            )
+
+    if args.task_type == "regression":
+        metadata[args.target_col] = metadata[args.target_col].astype(float)
+        if ood_metadata is not None:
+            ood_metadata[args.target_col] = ood_metadata[args.target_col].astype(float)
+        num_labels = 1
+    else:
+        metadata = metadata[metadata[args.target_col].notna()].copy()
+        metadata[args.target_col] = metadata[args.target_col].astype(int)
+        if ood_metadata is not None:
+            ood_metadata = ood_metadata[ood_metadata[args.target_col].notna()].copy()
+            ood_metadata[args.target_col] = ood_metadata[args.target_col].astype(int)
+        unique_labels = sorted(metadata[args.target_col].unique().tolist())
+        if unique_labels != list(range(len(unique_labels))):
+            label_map = {label: idx for idx, label in enumerate(unique_labels)}
+            metadata[args.target_col] = metadata[args.target_col].map(label_map).astype(int)
+            if ood_metadata is not None:
+                ood_metadata = ood_metadata[ood_metadata[args.target_col].isin(label_map)].copy()
+                ood_metadata[args.target_col] = ood_metadata[args.target_col].map(label_map).astype(int)
+        num_labels = int(metadata[args.target_col].nunique())
+        if num_labels < 2:
+            raise ValueError(f"Classification target {args.target_col!r} has fewer than 2 classes.")
 
     print(
         f"Probing {n_layers} layers across "
         f"{metadata['permutation_type'].nunique()} permutation types, "
-        f"{len(CONTROL_TASKS)} control settings, "
-        f"{len(seeds)} seeds, and {args.num_folds} folds"
+        f"{len(CONTROL_TASKS)} control settings, target={args.target_col}, task={args.task_type}, "
+        f"{len(seeds)} seeds, {args.num_folds} folds, and {args.num_workers} worker(s)"
     )
 
+    tasks: list[dict] = []
     for permutation_type, subset in metadata.groupby("permutation_type", sort=True):
         subset = subset.reset_index(drop=True)
         row_ids = subset["row_id"].astype(int).tolist()
-        labels = subset["absolute_accuracy_decay"].to_numpy(dtype=np.float32)
+        labels = subset[args.target_col].to_numpy(dtype=np.float32 if args.task_type == "regression" else np.int64)
         subset_indices = subset["row_id"].to_numpy(dtype=int)
         ood_subset = None
         if ood_metadata is not None:
@@ -448,42 +617,76 @@ def main() -> None:
             )
             continue
 
+        if args.task_type == "classification":
+            class_counts = subset[args.target_col].value_counts()
+            if class_counts.min() < args.num_folds:
+                print(
+                    f"  Skipping {permutation_type}: smallest class count is {class_counts.min()}, "
+                    f"which is insufficient for {args.num_folds}-fold stratified CV"
+                )
+                continue
+
         for layer_file in layer_files:
             layer_idx = int(layer_file.replace("layer_", "").replace(".npy", ""))
-            layer_states = np.load(internals_dir / layer_file)
-            subset_states = layer_states[subset_indices]
-            ood_layer_states = ood_labels = ood_row_ids = None
+            ood_indices = ood_labels = ood_row_ids = None
             if ood_subset is not None and not ood_subset.empty:
-                full_ood_states = np.load(Path(args.ood_internals_dir) / layer_file)
                 ood_indices = ood_subset["row_id"].to_numpy(dtype=int)
-                ood_layer_states = full_ood_states[ood_indices]
-                ood_labels = ood_subset["absolute_accuracy_decay"].to_numpy(dtype=np.float32)
+                ood_labels = ood_subset[args.target_col].to_numpy(
+                    dtype=np.float32 if args.task_type == "regression" else np.int64
+                )
                 ood_row_ids = ood_subset["row_id"].astype(int).tolist()
 
             for seed in seeds:
-                kfold = KFold(n_splits=args.num_folds, shuffle=True, random_state=seed)
-                for fold_idx, (train_pool_idx, test_idx) in enumerate(kfold.split(subset_states)):
+                if args.task_type == "classification":
+                    splitter = StratifiedKFold(n_splits=args.num_folds, shuffle=True, random_state=seed)
+                    split_iter = splitter.split(subset_indices, labels)
+                else:
+                    splitter = KFold(n_splits=args.num_folds, shuffle=True, random_state=seed)
+                    split_iter = splitter.split(subset_indices)
+                for fold_idx, (train_pool_idx, test_idx) in enumerate(split_iter):
                     for control_task in CONTROL_TASKS:
-                        run_layer(
-                            layer_idx=layer_idx,
-                            hidden_states=subset_states,
-                            labels=labels,
-                            row_ids=row_ids,
-                            permutation_type=permutation_type,
-                            control_task=control_task,
-                            reduced_dim=args.reduced_dim,
-                            seed=seed,
-                            fold_idx=fold_idx,
-                            train_pool_idx=train_pool_idx,
-                            test_idx=test_idx,
-                            dev_fraction=args.dev_fraction,
-                            n_total_layers=n_layers,
-                            results_dir=args.results_dir,
-                            model_name=args.model_name,
-                            ood_hidden_states=ood_layer_states,
-                            ood_labels=ood_labels,
-                            ood_row_ids=ood_row_ids,
+                        tasks.append(
+                            {
+                                "internals_dir": internals_dir,
+                                "ood_internals_dir": Path(args.ood_internals_dir) if args.ood_internals_dir else None,
+                                "layer_file": layer_file,
+                                "layer_idx": layer_idx,
+                                "subset_indices": subset_indices,
+                                "labels": labels,
+                                "row_ids": row_ids,
+                                "permutation_type": permutation_type,
+                                "control_task": control_task,
+                                "reduced_dim": args.reduced_dim,
+                                "target_col": args.target_col,
+                                "task_type": args.task_type,
+                                "num_labels": num_labels,
+                                "seed": seed,
+                                "fold_idx": fold_idx,
+                                "train_pool_idx": train_pool_idx,
+                                "test_idx": test_idx,
+                                "dev_fraction": args.dev_fraction,
+                                "n_total_layers": n_layers,
+                                "results_dir": args.results_dir,
+                                "model_name": args.model_name,
+                                "ood_indices": ood_indices,
+                                "ood_labels": ood_labels,
+                                "ood_row_ids": ood_row_ids,
+                            }
                         )
+
+    print(f"Built {len(tasks)} probe task(s)")
+
+    if args.num_workers <= 1:
+        for task in tasks:
+            run_probe_task(task)
+    else:
+        ctx = multiprocessing.get_context("spawn")
+        with concurrent.futures.ProcessPoolExecutor(
+            max_workers=args.num_workers,
+            mp_context=ctx,
+        ) as executor:
+            for _ in executor.map(run_probe_task, tasks):
+                pass
 
     print(f"\nDone. Results saved to {args.results_dir}/")
 

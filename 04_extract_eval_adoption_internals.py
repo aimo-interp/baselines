@@ -32,6 +32,7 @@ DEFAULT_VIEWS = [
     "output_last_token",
     "average_output",
 ]
+OPTIONAL_METADATA_COLUMNS = ["is_robust"]
 
 
 def parse_args() -> argparse.Namespace:
@@ -109,6 +110,11 @@ def build_instances(df: pd.DataFrame, system_prompt: str) -> list[InternalsInsta
                 "permutation_type": row["permutation_type"],
                 "absolute_accuracy_decay": float(row["absolute_accuracy_decay"]),
                 "original_problem": row["original_problem"],
+                **{
+                    col: row[col]
+                    for col in OPTIONAL_METADATA_COLUMNS
+                    if col in row and pd.notna(row[col])
+                },
             },
             system_prompt=system_prompt,
         )
@@ -241,6 +247,11 @@ def save_fast_input_last_token_view(
                 "absolute_accuracy_decay": float(row["absolute_accuracy_decay"]),
                 "original_problem": row["original_problem"],
                 "extraction_view": "input_last_token",
+                **{
+                    col: row[col]
+                    for col in OPTIONAL_METADATA_COLUMNS
+                    if col in row and pd.notna(row[col])
+                },
             }
         )
 
@@ -325,6 +336,11 @@ def main() -> None:
             "permutation_type": record.properties["permutation_type"],
             "absolute_accuracy_decay": float(record.properties["absolute_accuracy_decay"]),
             "original_problem": record.properties["original_problem"],
+            **{
+                col: record.properties[col]
+                for col in OPTIONAL_METADATA_COLUMNS
+                if col in record.properties
+            },
         }
         for record in records
     ]
