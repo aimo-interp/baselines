@@ -116,6 +116,22 @@ def build_instances(df: pd.DataFrame, system_prompt: str) -> list[InternalsInsta
     ]
 
 
+def build_prompt(tokenizer, user_text: str, system_prompt: str) -> str:
+    if hasattr(tokenizer, "apply_chat_template"):
+        try:
+            return tokenizer.apply_chat_template(
+                [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_text},
+                ],
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+        except Exception:
+            pass
+    return f"{system_prompt}\n\n{user_text}"
+
+
 def extract_view_vector(record, view: str, layer_idx: int) -> np.ndarray:
     run = record.run
     if view == "input_last_token":
@@ -173,6 +189,72 @@ def save_view(
     metadata.to_csv(output_dir / "metadata.csv", index=False)
 
 
+def save_fast_input_last_token_view(
+    df: pd.DataFrame,
+    model,
+    tokenizer,
+    system_prompt: str,
+    output_dir: Path,
+) -> None:
+    layer_storage: list[list[np.ndarray]] | None = None
+    metadata_rows: list[dict] = []
+
+    print(f"Extracting fast input_last_token internals for {len(df)} rows ...")
+    for idx, row in df.iterrows():
+        print(
+            f"  [{idx + 1:>{len(str(len(df)))}}/{len(df)}]  "
+            f"row_id={int(row['row_id'])}, problem_id={row['problem_id']!r}, model_id={row['model_id']!r}"
+        )
+        prompt = build_prompt(tokenizer, row["original_problem"], system_prompt)
+        enc = tokenizer(prompt, return_tensors="pt", truncation=True)
+        enc = {k: v.to(model.device) for k, v in enc.items()}
+
+        with torch.no_grad():
+            output = model(
+                **enc,
+                output_hidden_states=True,
+                return_dict=True,
+                use_cache=False,
+            )
+
+        hidden_states = output.hidden_states
+        if hidden_states is None:
+            raise RuntimeError("Model forward pass returned no hidden states.")
+
+        if layer_storage is None:
+            n_layers = len(hidden_states)
+            hidden_dim = hidden_states[0].shape[-1]
+            layer_storage = [[] for _ in range(n_layers)]
+            print(f"Fast path layers: {n_layers} | hidden_dim: {hidden_dim}")
+
+        for layer_idx, hs in enumerate(hidden_states):
+            vec = hs[0, -1, :].detach().float().cpu().numpy()
+            layer_storage[layer_idx].append(vec)
+
+        metadata_rows.append(
+            {
+                "row_id": int(row["row_id"]),
+                "problem_id": row["problem_id"],
+                "model_id": row["model_id"],
+                "dataset_id": row["dataset_id"],
+                "permutation_type": row["permutation_type"],
+                "absolute_accuracy_decay": float(row["absolute_accuracy_decay"]),
+                "original_problem": row["original_problem"],
+                "extraction_view": "input_last_token",
+            }
+        )
+
+    if layer_storage is None:
+        raise RuntimeError("No hidden states were extracted on the fast input path.")
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for layer_idx, rows in enumerate(layer_storage):
+        np.save(output_dir / f"layer_{layer_idx:03d}.npy", np.stack(rows))
+
+    metadata = pd.DataFrame(metadata_rows).sort_values("row_id")
+    metadata.to_csv(output_dir / "metadata.csv", index=False)
+
+
 def main() -> None:
     args = parse_args()
     base_output_dir = Path(args.output_dir)
@@ -194,6 +276,20 @@ def main() -> None:
     model = AutoModelForCausalLM.from_pretrained(args.model_id, torch_dtype=dtype)
     model.to(device)
     model.eval()
+
+    if views == ["input_last_token"]:
+        save_fast_input_last_token_view(
+            df=df,
+            model=model,
+            tokenizer=tokenizer,
+            system_prompt=system_prompt,
+            output_dir=view_output_dir(base_output_dir, "input_last_token"),
+        )
+        print(
+            "Saved view directories: "
+            + str(view_output_dir(base_output_dir, "input_last_token"))
+        )
+        return
 
     instances = build_instances(df, system_prompt)
     dataset = InternalsDataset(instances)
