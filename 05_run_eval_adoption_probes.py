@@ -38,7 +38,7 @@ import pandas as pd
 import torch
 from scipy.stats import spearmanr
 from sklearn.decomposition import PCA
-from sklearn.metrics import accuracy_score, f1_score, mean_squared_error
+from sklearn.metrics import accuracy_score, balanced_accuracy_score, f1_score, mean_squared_error
 from sklearn.metrics import pairwise_distances
 from sklearn.metrics.pairwise import linear_kernel, rbf_kernel
 from sklearn.model_selection import KFold, StratifiedKFold, train_test_split
@@ -64,6 +64,7 @@ DEFAULT_KERNEL = "rbf"
 DEFAULT_KERNEL_ALPHAS = [0.01, 0.1, 1.0, 10.0]
 DEFAULT_KERNEL_CS = [0.1, 1.0, 10.0, 100.0]
 DEFAULT_KERNEL_GAMMAS = ["scale", 0.001, 0.01, 0.1, 1.0]
+DEFAULT_BINARY_EVAL_COL = "is_robust"
 
 
 def parse_args() -> argparse.Namespace:
@@ -149,6 +150,17 @@ def parse_args() -> argparse.Namespace:
         default=",".join(str(value) for value in DEFAULT_KERNEL_GAMMAS),
         help="Comma-separated gamma values for RBF kernels. Use 'scale' to derive gamma from train variance.",
     )
+    parser.add_argument(
+        "--binary-eval-col",
+        default=DEFAULT_BINARY_EVAL_COL,
+        help="Optional binary label column used to compute threshold-based accuracy from regression predictions. Set to empty to disable.",
+    )
+    parser.add_argument(
+        "--threshold",
+        type=parse_threshold_arg,
+        default=None,
+        help="Threshold for converting regression predictions to binary labels. Use 'auto' to infer on the train split.",
+    )
     return parser.parse_args()
 
 
@@ -179,6 +191,15 @@ def parse_gamma_grid(raw: str) -> list[str | float]:
     if not values:
         raise ValueError("Expected at least one gamma value.")
     return values
+
+
+def parse_threshold_arg(value: str) -> float | None:
+    if value.strip().lower() == "auto":
+        return None
+    try:
+        return float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("threshold must be a float or 'auto'") from exc
 
 
 def infer_task_type(series: pd.Series) -> str:
@@ -709,6 +730,118 @@ def safe_pearson(preds: np.ndarray, labels: np.ndarray) -> float:
     return float(np.corrcoef(preds, labels)[0, 1])
 
 
+def threshold_predictions(y_pred: np.ndarray, threshold: float) -> np.ndarray:
+    return np.asarray(y_pred, dtype=np.float64) < float(threshold)
+
+
+def compute_threshold_metrics(
+    y_true_binary: np.ndarray,
+    y_pred: np.ndarray,
+    threshold: float,
+) -> dict[str, float]:
+    y_true_binary = np.asarray(y_true_binary).astype(bool)
+    y_pred_binary = threshold_predictions(y_pred, threshold)
+    return {
+        "threshold_accuracy": float(accuracy_score(y_true_binary, y_pred_binary)),
+        "threshold_balanced_accuracy": float(balanced_accuracy_score(y_true_binary, y_pred_binary)),
+    }
+
+
+def find_optimal_threshold(
+    y_true_binary: np.ndarray,
+    y_pred: np.ndarray,
+) -> float:
+    eval_df = pd.DataFrame(
+        {
+            "prediction": pd.Series(y_pred).astype(float),
+            "label": pd.Series(y_true_binary).astype(bool),
+        }
+    ).sort_values("prediction", kind="stable")
+
+    grouped = (
+        eval_df.groupby("prediction", sort=True)["label"]
+        .agg(["sum", "count"])
+        .reset_index()
+    )
+    grouped["neg_count"] = grouped["count"] - grouped["sum"]
+
+    total_neg = int(grouped["neg_count"].sum())
+    best_correct = total_neg
+    best_threshold = float(grouped.iloc[0]["prediction"])
+
+    pos_prefix = 0
+    neg_prefix = 0
+    for idx in range(len(grouped)):
+        row = grouped.iloc[idx]
+        pos_prefix += int(row["sum"])
+        neg_prefix += int(row["neg_count"])
+        correct = pos_prefix + (total_neg - neg_prefix)
+        if correct <= best_correct:
+            continue
+        if idx == len(grouped) - 1:
+            threshold = float("inf")
+        else:
+            left = float(row["prediction"])
+            right = float(grouped.iloc[idx + 1]["prediction"])
+            threshold = left + (right - left) / 2.0
+        best_correct = correct
+        best_threshold = threshold
+    return best_threshold
+
+
+def row_id_label_lookup(row_ids: list[int], labels: np.ndarray | list[int] | list[bool]) -> dict[int, bool]:
+    return {int(row_id): bool(label) for row_id, label in zip(row_ids, labels)}
+
+
+def dataset_row_ids(dataset: ProbingDataset) -> list[int]:
+    return [int(item[0][0].split("_")[-1]) for item in dataset.inputs]
+
+
+def lookup_binary_labels(row_ids: list[int], label_lookup: dict[int, bool] | None) -> np.ndarray | None:
+    if label_lookup is None:
+        return None
+    return np.asarray([label_lookup[int(row_id)] for row_id in row_ids], dtype=bool)
+
+
+def apply_threshold_metrics(
+    metrics_row: dict[str, float | int | str],
+    train_preds: np.ndarray,
+    train_binary_labels: np.ndarray | None,
+    val_preds: np.ndarray,
+    val_binary_labels: np.ndarray | None,
+    test_preds: np.ndarray,
+    test_binary_labels: np.ndarray | None,
+    threshold: float | None,
+    ood_preds: np.ndarray | None = None,
+    ood_binary_labels: np.ndarray | None = None,
+) -> dict[str, float | int | str]:
+    if train_binary_labels is None or val_binary_labels is None or test_binary_labels is None:
+        return metrics_row
+
+    resolved_threshold = threshold
+    if resolved_threshold is None:
+        resolved_threshold = find_optimal_threshold(train_binary_labels, train_preds)
+
+    metrics_row["threshold"] = float(resolved_threshold)
+    train_metrics = compute_threshold_metrics(train_binary_labels, train_preds, resolved_threshold)
+    val_metrics = compute_threshold_metrics(val_binary_labels, val_preds, resolved_threshold)
+    test_metrics = compute_threshold_metrics(test_binary_labels, test_preds, resolved_threshold)
+    metrics_row["train threshold_accuracy"] = train_metrics["threshold_accuracy"]
+    metrics_row["train threshold_balanced_accuracy"] = train_metrics["threshold_balanced_accuracy"]
+    metrics_row["val threshold_accuracy"] = val_metrics["threshold_accuracy"]
+    metrics_row["val threshold_balanced_accuracy"] = val_metrics["threshold_balanced_accuracy"]
+    metrics_row["full test threshold_accuracy"] = test_metrics["threshold_accuracy"]
+    metrics_row["full test threshold_balanced_accuracy"] = test_metrics["threshold_balanced_accuracy"]
+    metrics_row["unseen test threshold_accuracy"] = test_metrics["threshold_accuracy"]
+    metrics_row["unseen test threshold_balanced_accuracy"] = test_metrics["threshold_balanced_accuracy"]
+
+    if ood_preds is not None and ood_binary_labels is not None:
+        ood_metrics = compute_threshold_metrics(ood_binary_labels, ood_preds, resolved_threshold)
+        metrics_row["ood test threshold_accuracy"] = ood_metrics["threshold_accuracy"]
+        metrics_row["ood test threshold_balanced_accuracy"] = ood_metrics["threshold_balanced_accuracy"]
+    return metrics_row
+
+
 def build_prediction_frame(
     row_ids: list[int],
     permutation_type: str,
@@ -857,9 +990,12 @@ def run_kernel_layer(
     kernel_alphas: list[float],
     kernel_c_values: list[float],
     kernel_gammas: list[str | float],
+    binary_eval_labels: np.ndarray | None = None,
+    threshold: float | None = None,
     ood_hidden_states: np.ndarray | None = None,
     ood_labels: np.ndarray | None = None,
     ood_row_ids: list[int] | None = None,
+    ood_binary_eval_labels: np.ndarray | None = None,
 ) -> None:
     split = make_fold_arrays(
         hidden_states=hidden_states,
@@ -886,6 +1022,16 @@ def run_kernel_layer(
     train_lbls = np.asarray(split["train_lbls"])
     dev_lbls = np.asarray(split["dev_lbls"])
     test_lbls = np.asarray(split["test_lbls"])
+    binary_eval_lookup = row_id_label_lookup(row_ids, binary_eval_labels) if binary_eval_labels is not None else None
+    ood_binary_lookup = (
+        row_id_label_lookup(ood_row_ids, ood_binary_eval_labels)
+        if ood_row_ids is not None and ood_binary_eval_labels is not None
+        else None
+    )
+    train_binary_labels = lookup_binary_labels(split["train_row_ids"], binary_eval_lookup)
+    dev_binary_labels = lookup_binary_labels(split["dev_row_ids"], binary_eval_lookup)
+    test_binary_labels = lookup_binary_labels(split["test_row_ids"], binary_eval_lookup)
+    ood_binary_labels = lookup_binary_labels(split["ood_row_ids"], ood_binary_lookup) if split["ood_row_ids"] is not None else None
     hidden_dim = int(train_vecs.shape[1])
     done_dir = expected_done_dir(
         results_dir=results_dir,
@@ -915,6 +1061,8 @@ def run_kernel_layer(
         )
         test_kernel = compute_kernel_matrix(train_vecs, test_vecs, kernel_kind, best_params["gamma"])
         test_preds = model.predict(test_kernel).astype(np.float64)
+        train_kernel = compute_kernel_matrix(train_vecs, train_vecs, kernel_kind, best_params["gamma"])
+        train_preds = model.predict(train_kernel).astype(np.float64)
         test_losses = (test_preds - test_lbls.astype(np.float64)) ** 2
         preds_df = build_prediction_frame(
             row_ids=split["test_row_ids"],
@@ -948,6 +1096,7 @@ def run_kernel_layer(
         }
         ood_preds_df = None
         ood_metrics = None
+        ood_preds = None
         if ood_vecs is not None and split["ood_lbls"] is not None and split["ood_row_ids"] is not None:
             ood_kernel = compute_kernel_matrix(train_vecs, ood_vecs, kernel_kind, best_params["gamma"])
             ood_preds = model.predict(ood_kernel).astype(np.float64)
@@ -965,6 +1114,18 @@ def run_kernel_layer(
                 "ood test error": float(mean_squared_error(split["ood_lbls"], ood_preds)),
                 "ood test pearson": safe_pearson(ood_preds, np.asarray(split["ood_lbls"], dtype=np.float64)),
             }
+        metrics_row = apply_threshold_metrics(
+            metrics_row,
+            train_preds=train_preds,
+            train_binary_labels=train_binary_labels,
+            val_preds=dev_preds,
+            val_binary_labels=dev_binary_labels,
+            test_preds=test_preds,
+            test_binary_labels=test_binary_labels,
+            threshold=threshold,
+            ood_preds=ood_preds,
+            ood_binary_labels=ood_binary_labels,
+        )
     else:
         model, best_params, dev_preds = select_best_kernel_classifier(
             train_vecs=train_vecs,
@@ -1183,9 +1344,12 @@ def run_layer(
     n_total_layers: int,
     results_dir: str,
     model_name: str,
+    binary_eval_labels: np.ndarray | None = None,
+    threshold: float | None = None,
     ood_hidden_states: np.ndarray | None = None,
     ood_labels: np.ndarray | None = None,
     ood_row_ids: list[int] | None = None,
+    ood_binary_eval_labels: np.ndarray | None = None,
 ) -> None:
     train_ds, dev_ds, test_ds, ood_ds = make_fold_datasets(
         hidden_states,
@@ -1246,6 +1410,48 @@ def run_layer(
     )
     result_log_dir, _, probing_model = run_worker(worker)
 
+    if task_type == "regression" and probing_model is not None:
+        binary_eval_lookup = row_id_label_lookup(row_ids, binary_eval_labels) if binary_eval_labels is not None else None
+        ood_binary_lookup = (
+            row_id_label_lookup(ood_row_ids, ood_binary_eval_labels)
+            if ood_row_ids is not None and ood_binary_eval_labels is not None
+            else None
+        )
+        train_preds_df, _ = evaluate_regression_dataset(probing_model, train_ds)
+        dev_preds_df, _ = evaluate_regression_dataset(probing_model, dev_ds)
+        test_preds_df, _ = evaluate_regression_dataset(probing_model, test_ds)
+        train_binary_labels = lookup_binary_labels(dataset_row_ids(train_ds), binary_eval_lookup)
+        dev_binary_labels = lookup_binary_labels(dataset_row_ids(dev_ds), binary_eval_lookup)
+        test_binary_labels = lookup_binary_labels(dataset_row_ids(test_ds), binary_eval_lookup)
+        ood_preds = None
+        ood_binary_labels = None
+        if ood_ds is not None:
+            ood_preds_df_threshold, _ = evaluate_regression_dataset(probing_model, ood_ds)
+            ood_preds = ood_preds_df_threshold["pred"].to_numpy(dtype=np.float64)
+            ood_binary_labels = lookup_binary_labels(dataset_row_ids(ood_ds), ood_binary_lookup)
+        metrics_path = Path(result_log_dir) / "metrics.csv"
+        if metrics_path.exists():
+            metrics_df = pd.read_csv(metrics_path)
+            if not metrics_df.empty:
+                updated_row = metrics_df.iloc[-1].to_dict()
+                updated_row = apply_threshold_metrics(
+                    updated_row,
+                    train_preds=train_preds_df["pred"].to_numpy(dtype=np.float64),
+                    train_binary_labels=train_binary_labels,
+                    val_preds=dev_preds_df["pred"].to_numpy(dtype=np.float64),
+                    val_binary_labels=dev_binary_labels,
+                    test_preds=test_preds_df["pred"].to_numpy(dtype=np.float64),
+                    test_binary_labels=test_binary_labels,
+                    threshold=threshold,
+                    ood_preds=ood_preds,
+                    ood_binary_labels=ood_binary_labels,
+                )
+                for column in updated_row:
+                    if column not in metrics_df.columns:
+                        metrics_df[column] = np.nan
+                metrics_df.iloc[-1] = pd.Series(updated_row)
+                metrics_df.to_csv(metrics_path, index=False)
+
     if ood_ds is not None and probing_model is not None:
         ood_preds, ood_metrics = evaluate_dataset(probing_model, ood_ds, task_type)
         ood_preds.to_csv(f"{result_log_dir}/ood_preds.csv")
@@ -1286,9 +1492,12 @@ def run_probe_task(task: dict) -> dict:
             kernel_alphas=task["kernel_alphas"],
             kernel_c_values=task["kernel_c_values"],
             kernel_gammas=task["kernel_gammas"],
+            binary_eval_labels=task["binary_eval_labels"],
+            threshold=task["threshold"],
             ood_hidden_states=ood_layer_states,
             ood_labels=ood_labels,
             ood_row_ids=ood_row_ids,
+            ood_binary_eval_labels=task["ood_binary_eval_labels"],
         )
     elif task["method"] in {"cka", "rsa"}:
         run_similarity_layer(
@@ -1335,9 +1544,12 @@ def run_probe_task(task: dict) -> dict:
             n_total_layers=task["n_total_layers"],
             results_dir=task["results_dir"],
             model_name=task["model_name"],
+            binary_eval_labels=task["binary_eval_labels"],
+            threshold=task["threshold"],
             ood_hidden_states=ood_layer_states,
             ood_labels=ood_labels,
             ood_row_ids=ood_row_ids,
+            ood_binary_eval_labels=task["ood_binary_eval_labels"],
         )
     return {
         "permutation_type": task["permutation_type"],
@@ -1374,6 +1586,22 @@ def main() -> None:
             )
 
     task_type = infer_task_type(metadata[args.target_col])
+    binary_eval_col = args.binary_eval_col.strip()
+    use_binary_eval = False
+    if task_type == "regression" and binary_eval_col:
+        if binary_eval_col in metadata.columns:
+            use_binary_eval = True
+            metadata = metadata[metadata[binary_eval_col].notna()].copy()
+            metadata[binary_eval_col] = metadata[binary_eval_col].astype(bool)
+            if ood_metadata is not None and binary_eval_col in ood_metadata.columns:
+                ood_metadata = ood_metadata[ood_metadata[binary_eval_col].notna()].copy()
+                ood_metadata[binary_eval_col] = ood_metadata[binary_eval_col].astype(bool)
+            elif ood_metadata is not None:
+                raise ValueError(
+                    f"Binary eval column {binary_eval_col!r} not found in {Path(args.ood_internals_dir) / 'metadata.csv'}"
+                )
+        else:
+            print(f"Binary eval column {binary_eval_col!r} not found; threshold metrics disabled.")
 
     if task_type == "regression":
         metadata[args.target_col] = metadata[args.target_col].astype(float)
@@ -1403,6 +1631,8 @@ def main() -> None:
         f"{len(CONTROL_TASKS)} control settings, target={args.target_col}, task={task_type}, "
         f"{len(seeds)} seeds, {args.num_folds} folds, and {args.num_workers} worker(s)"
     )
+    if use_binary_eval:
+        print(f"Threshold metrics enabled via binary label column {binary_eval_col!r} with threshold={args.threshold if args.threshold is not None else 'auto'}")
 
     tasks: list[dict] = []
     skipped_done = 0
@@ -1410,6 +1640,7 @@ def main() -> None:
         subset = subset.reset_index(drop=True)
         row_ids = subset["row_id"].astype(int).tolist()
         labels = subset[args.target_col].to_numpy(dtype=np.float32 if task_type == "regression" else np.int64)
+        binary_eval_labels = subset[binary_eval_col].to_numpy(dtype=bool) if use_binary_eval else None
         subset_indices = subset["row_id"].to_numpy(dtype=int)
         ood_subset = None
         if ood_metadata is not None:
@@ -1441,6 +1672,9 @@ def main() -> None:
                     dtype=np.float32 if task_type == "regression" else np.int64
                 )
                 ood_row_ids = ood_subset["row_id"].astype(int).tolist()
+                ood_binary_eval_labels = ood_subset[binary_eval_col].to_numpy(dtype=bool) if use_binary_eval else None
+            else:
+                ood_binary_eval_labels = None
 
             for seed in seeds:
                 if task_type == "classification":
@@ -1483,6 +1717,8 @@ def main() -> None:
                                 "kernel_alphas": kernel_alphas,
                                 "kernel_c_values": kernel_c_values,
                                 "kernel_gammas": kernel_gammas,
+                                "binary_eval_labels": binary_eval_labels,
+                                "threshold": args.threshold,
                                 "seed": seed,
                                 "fold_idx": fold_idx,
                                 "train_pool_idx": train_pool_idx,
@@ -1494,6 +1730,7 @@ def main() -> None:
                                 "ood_indices": ood_indices,
                                 "ood_labels": ood_labels,
                                 "ood_row_ids": ood_row_ids,
+                                "ood_binary_eval_labels": ood_binary_eval_labels,
                             }
                         )
 
