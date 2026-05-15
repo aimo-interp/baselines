@@ -457,6 +457,67 @@ def evaluate_regression_dataset(
     return prediction_frame
 
 
+def evaluate_classification_dataset(
+    probing_model: torch.nn.Module,
+    dataset: ProbingDataset,
+) -> pd.DataFrame:
+    dataloader = probing_model.get_test_dataloader(dataset, 300, shuffle=False)
+    all_preds: list[np.ndarray] = []
+    all_labels: list[np.ndarray] = []
+    all_losses: list[np.ndarray] = []
+    all_seen: list[np.ndarray] = []
+
+    probing_model.eval()
+    with torch.no_grad():
+        for x, y, seen_indices in dataloader:
+            x = x.to(probing_model.device)
+            y = y.to(probing_model.device)
+            logits = probing_model(x)
+            pred = logits.argmax(dim=1)
+            losses = (pred != y).detach().cpu().numpy().astype(np.float64)
+            all_preds.append(pred.detach().cpu().numpy())
+            all_labels.append(y.detach().cpu().numpy())
+            all_losses.append(losses)
+            all_seen.append(seen_indices.detach().cpu().numpy())
+
+    preds = np.concatenate(all_preds) if all_preds else np.array([], dtype=np.int64)
+    labels = np.concatenate(all_labels) if all_labels else np.array([], dtype=np.int64)
+    losses = np.concatenate(all_losses) if all_losses else np.array([], dtype=np.float64)
+    seen = np.concatenate(all_seen) if all_seen else np.array([], dtype=bool)
+
+    instances = [instance_input for instance_input in dataset.inputs]
+    prediction_frame = pd.DataFrame(
+        {
+            "instance": instances,
+            "pred": preds,
+            "label": labels,
+            "loss": losses,
+            "seen": np.where(seen, "seen", "ood"),
+        }
+    )
+    return prediction_frame
+
+
+def apply_classification_metrics(
+    metrics_row: dict[str, float | int | str],
+    val_preds: np.ndarray,
+    val_labels: np.ndarray,
+    test_preds: np.ndarray,
+    test_labels: np.ndarray,
+) -> dict[str, float | int | str]:
+    val_balanced_acc = float(balanced_accuracy_score(val_labels, val_preds))
+    test_balanced_acc = float(balanced_accuracy_score(test_labels, test_preds))
+
+    metrics_row["val balanced_acc"] = val_balanced_acc
+    metrics_row["full test balanced_acc"] = test_balanced_acc
+    metrics_row["unseen test balanced_acc"] = test_balanced_acc
+    if "middle test balanced_acc" not in metrics_row:
+        metrics_row["middle test balanced_acc"] = np.nan
+    if "upper test balanced_acc" not in metrics_row:
+        metrics_row["upper test balanced_acc"] = np.nan
+    return metrics_row
+
+
 def expected_done_dir(
     results_dir: str,
     target_col: str,
@@ -900,14 +961,19 @@ def run_kernel_layer(
             "epoch": 0,
             "step": 0,
             "full test acc": float(accuracy_score(test_lbls, test_preds)),
+            "full test balanced_acc": float(balanced_accuracy_score(test_lbls, test_preds)),
             "full test f1": float(f1_score(test_lbls, test_preds, average="macro")),
             "middle test acc": np.nan,
+            "middle test balanced_acc": np.nan,
             "middle test f1": np.nan,
             "unseen test acc": float(accuracy_score(test_lbls, test_preds)),
+            "unseen test balanced_acc": float(balanced_accuracy_score(test_lbls, test_preds)),
             "unseen test f1": float(f1_score(test_lbls, test_preds, average="macro")),
             "upper test acc": np.nan,
+            "upper test balanced_acc": np.nan,
             "upper test f1": np.nan,
             "val acc": float(accuracy_score(dev_lbls, dev_preds)),
+            "val balanced_acc": float(balanced_accuracy_score(dev_lbls, dev_preds)),
             "val f1": float(f1_score(dev_lbls, dev_preds, average="macro")),
             "val_ref": float(f1_score(dev_lbls, dev_preds, average="macro")),
             "kernel_type": kernel_kind,
@@ -1018,6 +1084,26 @@ def run_layer(
                     test_preds=test_preds_df["pred"].to_numpy(dtype=np.float64),
                     test_binary_labels=test_binary_labels,
                     threshold=threshold,
+                )
+                for column in updated_row:
+                    if column not in metrics_df.columns:
+                        metrics_df[column] = np.nan
+                metrics_df.iloc[-1] = pd.Series(updated_row)
+                metrics_df.to_csv(metrics_path, index=False)
+    elif task_type == "classification" and probing_model is not None:
+        dev_preds_df = evaluate_classification_dataset(probing_model, dev_ds)
+        test_preds_df = evaluate_classification_dataset(probing_model, test_ds)
+        metrics_path = Path(result_log_dir) / "metrics.csv"
+        if metrics_path.exists():
+            metrics_df = pd.read_csv(metrics_path)
+            if not metrics_df.empty:
+                updated_row = metrics_df.iloc[-1].to_dict()
+                updated_row = apply_classification_metrics(
+                    updated_row,
+                    val_preds=dev_preds_df["pred"].to_numpy(dtype=np.int64),
+                    val_labels=dev_preds_df["label"].to_numpy(dtype=np.int64),
+                    test_preds=test_preds_df["pred"].to_numpy(dtype=np.int64),
+                    test_labels=test_preds_df["label"].to_numpy(dtype=np.int64),
                 )
                 for column in updated_row:
                     if column not in metrics_df.columns:
