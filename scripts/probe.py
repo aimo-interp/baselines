@@ -5,8 +5,7 @@ For each `permutation_type`, this script:
 1. runs a repeated K-fold evaluation across configurable seeds and folds,
 2. carves a validation split out of each fold's training pool for early stopping,
 3. trains one linear probe per transformer layer and control setup,
-4. optionally evaluates the trained probe on an additional OOD internals set,
-5. writes results via the Holmes CSV logger.
+4. writes results via the Holmes CSV logger.
 
 The default target is `absolute_accuracy_decay`, but the script can also run
 classification probes, e.g. against `is_robust`. Task type is inferred from
@@ -14,8 +13,8 @@ the target column values.
 
 `permutation_type` is an eval-adoption perturbation label, not a Holmes control
 task. We therefore keep it in the probe name and dataset row identifiers, while
-running Holmes control-task variants (`NONE`, `RANDOMIZATION`, `PERMUTATION`)
-explicitly as a separate sweep dimension.
+running Holmes control-task variants (`NONE`, `RANDOMIZATION`) explicitly as a
+separate sweep dimension.
 
 Dimensionality reduction is optional. When enabled, each split is projected into
 a lower-dimensional PCA space fit on the training vectors only. This reduces
@@ -26,7 +25,6 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
-import json
 import multiprocessing
 import os
 import random
@@ -36,18 +34,17 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import torch
-from scipy.stats import spearmanr
 from sklearn.decomposition import PCA
 from sklearn.metrics import accuracy_score, balanced_accuracy_score, f1_score, mean_squared_error
-from sklearn.metrics import pairwise_distances
 from sklearn.metrics.pairwise import linear_kernel, rbf_kernel
 from sklearn.model_selection import KFold, StratifiedKFold, train_test_split
 from sklearn.svm import SVC
 from sklearn.kernel_ridge import KernelRidge
 
-HOLMES_CORE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "holmes-evaluation", "core")
-if HOLMES_CORE not in sys.path:
-    sys.path.insert(0, HOLMES_CORE)
+REPO_ROOT = Path(__file__).resolve().parents[1]
+HOLMES_CORE = REPO_ROOT / "holmes-evaluation" / "core"
+if str(HOLMES_CORE) not in sys.path:
+    sys.path.insert(0, str(HOLMES_CORE))
 
 from probing_worker import GeneralProbeWorker  # noqa: E402
 from utilities.data_loading import ProbingDataset  # noqa: E402
@@ -108,11 +105,6 @@ def parse_args() -> argparse.Namespace:
         help="Fraction of each fold's training pool reserved for validation.",
     )
     parser.add_argument(
-        "--ood-internals-dir",
-        default="",
-        help="Optional directory containing a second metadata.csv plus layer_XXX.npy files used as an additional OOD test set.",
-    )
-    parser.add_argument(
         "--target-col",
         default=DEFAULT_TARGET_COL,
         help="Metadata column used as the probe target, e.g. absolute_accuracy_decay or is_robust. Task type is inferred from its values.",
@@ -126,8 +118,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--method",
         default=DEFAULT_METHOD,
-        choices=["probe", "kernel", "cka", "rsa"],
-        help="Evaluation method: linear probe, kernel baseline, centered kernel alignment, or RSA.",
+        choices=["probe", "kernel"],
+        help="Evaluation method: linear probe or kernel baseline.",
     )
     parser.add_argument(
         "--kernel",
@@ -258,10 +250,6 @@ def apply_control(
         shuffled_labels = lbls.tolist()
         rng.shuffle(shuffled_labels)
         return vecs, np.asarray(shuffled_labels, dtype=lbls.dtype)
-    if control_task == "PERMUTATION":
-        shuffled = list(range(len(vecs)))
-        rng.shuffle(shuffled)
-        return vecs[shuffled], lbls
     return vecs, lbls
 
 
@@ -272,10 +260,9 @@ def maybe_reduce(
     reduced_dim: int,
     seed: int,
     permutation_type: str,
-    ood_vecs: np.ndarray | None = None,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray | None]:
+ ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     if reduced_dim <= 0:
-        return train_vecs, dev_vecs, test_vecs, ood_vecs
+        return train_vecs, dev_vecs, test_vecs
 
     n_components = min(reduced_dim, train_vecs.shape[0], train_vecs.shape[1])
     if n_components < 1:
@@ -288,8 +275,7 @@ def maybe_reduce(
     train_reduced = pca.fit_transform(train_vecs).astype(np.float32)
     dev_reduced = pca.transform(dev_vecs).astype(np.float32)
     test_reduced = pca.transform(test_vecs).astype(np.float32)
-    ood_reduced = pca.transform(ood_vecs).astype(np.float32) if ood_vecs is not None else None
-    return train_reduced, dev_reduced, test_reduced, ood_reduced
+    return train_reduced, dev_reduced, test_reduced
 
 
 def build_dataset(
@@ -316,10 +302,7 @@ def make_fold_datasets(
     test_idx: np.ndarray,
     dev_fraction: float,
     seed: int,
-    ood_hidden_states: np.ndarray | None = None,
-    ood_labels: np.ndarray | None = None,
-    ood_row_ids: list[int] | None = None,
-) -> tuple[ProbingDataset, ProbingDataset, ProbingDataset, ProbingDataset | None]:
+) -> tuple[ProbingDataset, ProbingDataset, ProbingDataset]:
     train_pool_idx = np.asarray(train_pool_idx)
     test_idx = np.asarray(test_idx)
 
@@ -349,18 +332,13 @@ def make_fold_datasets(
     dev_vecs, dev_lbls = apply_control(hidden_states[dev_idx], labels[dev_idx], control_task, seed)
     test_vecs, test_lbls = apply_control(hidden_states[test_idx], labels[test_idx], control_task, seed)
 
-    ood_vecs = ood_lbls = None
-    if ood_hidden_states is not None and ood_labels is not None:
-        ood_vecs, ood_lbls = apply_control(ood_hidden_states, ood_labels, control_task, seed)
-
-    train_vecs, dev_vecs, test_vecs, ood_vecs = maybe_reduce(
+    train_vecs, dev_vecs, test_vecs = maybe_reduce(
         train_vecs,
         dev_vecs,
         test_vecs,
         reduced_dim,
         seed,
         permutation_type,
-        ood_vecs=ood_vecs,
     )
 
     train_ds = build_dataset([row_ids[i] for i in train_idx.tolist()], permutation_type, train_vecs, train_lbls, prefix="train")
@@ -370,12 +348,7 @@ def make_fold_datasets(
     dev_ds.update_seen(train_ds.unique_inputs)
     test_ds.update_seen(train_ds.unique_inputs)
 
-    ood_ds = None
-    if ood_vecs is not None and ood_lbls is not None and ood_row_ids is not None:
-        ood_ds = build_dataset(ood_row_ids, permutation_type, ood_vecs, ood_lbls, prefix="ood")
-        ood_ds.update_seen(train_ds.unique_inputs)
-
-    return train_ds, dev_ds, test_ds, ood_ds
+    return train_ds, dev_ds, test_ds
 
 
 def make_fold_arrays(
@@ -390,11 +363,8 @@ def make_fold_arrays(
     test_idx: np.ndarray,
     dev_fraction: float,
     seed: int,
-    ood_hidden_states: np.ndarray | None = None,
-    ood_labels: np.ndarray | None = None,
-    ood_row_ids: list[int] | None = None,
 ) -> dict[str, np.ndarray | list[int] | None]:
-    train_ds, dev_ds, test_ds, ood_ds = make_fold_datasets(
+    train_ds, dev_ds, test_ds = make_fold_datasets(
         hidden_states=hidden_states,
         labels=labels,
         row_ids=row_ids,
@@ -406,9 +376,6 @@ def make_fold_arrays(
         test_idx=test_idx,
         dev_fraction=dev_fraction,
         seed=seed,
-        ood_hidden_states=ood_hidden_states,
-        ood_labels=ood_labels,
-        ood_row_ids=ood_row_ids,
     )
 
     result: dict[str, np.ndarray | list[int] | None] = {
@@ -421,14 +388,7 @@ def make_fold_arrays(
         "test_vecs": np.asarray(test_ds.inputs_encoded, dtype=np.float32),
         "test_lbls": np.asarray(test_ds.labels),
         "test_row_ids": [int(item[0][0].split("_")[-1]) for item in test_ds.inputs],
-        "ood_vecs": None,
-        "ood_lbls": None,
-        "ood_row_ids": None,
     }
-    if ood_ds is not None:
-        result["ood_vecs"] = np.asarray(ood_ds.inputs_encoded, dtype=np.float32)
-        result["ood_lbls"] = np.asarray(ood_ds.labels)
-        result["ood_row_ids"] = [int(item[0][0].split("_")[-1]) for item in ood_ds.inputs]
     return result
 
 
@@ -459,7 +419,7 @@ def run_worker(worker: GeneralProbeWorker) -> tuple[str, pd.DataFrame, torch.nn.
 def evaluate_regression_dataset(
     probing_model: torch.nn.Module,
     dataset: ProbingDataset,
-) -> tuple[pd.DataFrame, dict[str, float]]:
+) -> pd.DataFrame:
     dataloader = probing_model.get_test_dataloader(dataset, 300, shuffle=False)
     all_preds: list[np.ndarray] = []
     all_labels: list[np.ndarray] = []
@@ -494,77 +454,7 @@ def evaluate_regression_dataset(
         }
     )
 
-    if len(preds) == 0:
-        metrics = {"ood test error": np.nan, "ood test pearson": np.nan}
-    else:
-        mse = float(np.mean((preds - labels) ** 2))
-        if len(preds) < 2 or np.isclose(np.std(preds), 0.0) or np.isclose(np.std(labels), 0.0):
-            pearson = np.nan
-        else:
-            pearson = float(np.corrcoef(preds, labels)[0, 1])
-        metrics = {"ood test error": mse, "ood test pearson": pearson}
-
-    return prediction_frame, metrics
-
-
-def evaluate_dataset(
-    probing_model: torch.nn.Module,
-    dataset: ProbingDataset,
-    task_type: str,
-) -> tuple[pd.DataFrame, dict[str, float]]:
-    if task_type == "regression":
-        return evaluate_regression_dataset(probing_model, dataset)
-
-    dataloader = probing_model.get_test_dataloader(dataset, 300, shuffle=False)
-    all_probs: list[np.ndarray] = []
-    all_pred_labels: list[np.ndarray] = []
-    all_labels: list[np.ndarray] = []
-    all_losses: list[np.ndarray] = []
-    all_seen: list[np.ndarray] = []
-
-    probing_model.eval()
-    with torch.no_grad():
-        for x, y, seen_indices in dataloader:
-            x = x.to(probing_model.device)
-            y = y.to(probing_model.device)
-            probs = probing_model(x)
-            probs = torch.nn.Softmax(dim=1)(probs)
-            pred_labels = probs.argmax(dim=1)
-            losses = probing_model.loss(probs, y).detach().cpu().numpy()
-            all_probs.append(probs.detach().cpu().double().numpy())
-            all_pred_labels.append(pred_labels.detach().cpu().numpy())
-            all_labels.append(y.detach().cpu().numpy())
-            all_losses.append(losses)
-            all_seen.append(seen_indices.detach().cpu().numpy())
-
-    probs = np.concatenate(all_probs) if all_probs else np.empty((0, 2), dtype=np.float64)
-    pred_labels = np.concatenate(all_pred_labels) if all_pred_labels else np.array([], dtype=np.int64)
-    labels = np.concatenate(all_labels) if all_labels else np.array([], dtype=np.int64)
-    losses = np.concatenate(all_losses) if all_losses else np.array([], dtype=np.float64)
-    seen = np.concatenate(all_seen) if all_seen else np.array([], dtype=bool)
-
-    instances = [instance_input for instance_input in dataset.inputs]
-    prediction_frame = pd.DataFrame(
-        {
-            "instance": instances,
-            "pred": pred_labels,
-            "label": labels,
-            "loss": losses,
-            "seen": np.where(seen, "seen", "ood"),
-        }
-    )
-    if probs.size:
-        prediction_frame["prob_1"] = probs[:, 1] if probs.shape[1] > 1 else probs[:, 0]
-
-    if len(pred_labels) == 0:
-        metrics = {"ood test acc": np.nan, "ood test f1": np.nan}
-    else:
-        metrics = {
-            "ood test acc": float(accuracy_score(labels, pred_labels)),
-            "ood test f1": float(f1_score(labels, pred_labels, average="macro")),
-        }
-
-    return prediction_frame, metrics
+    return prediction_frame
 
 
 def expected_done_dir(
@@ -618,8 +508,7 @@ def standardize_splits(
     train_vecs: np.ndarray,
     dev_vecs: np.ndarray,
     test_vecs: np.ndarray,
-    ood_vecs: np.ndarray | None = None,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray | None]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     train_vecs = np.asarray(train_vecs, dtype=np.float64)
     dev_vecs = np.asarray(dev_vecs, dtype=np.float64)
     test_vecs = np.asarray(test_vecs, dtype=np.float64)
@@ -629,8 +518,7 @@ def standardize_splits(
     train_scaled = (train_vecs - mean) / std
     dev_scaled = (dev_vecs - mean) / std
     test_scaled = (test_vecs - mean) / std
-    ood_scaled = None if ood_vecs is None else (np.asarray(ood_vecs, dtype=np.float64) - mean) / std
-    return train_scaled, dev_scaled, test_scaled, ood_scaled
+    return train_scaled, dev_scaled, test_scaled
 
 
 def resolve_gamma(train_vecs: np.ndarray, gamma: str | float) -> float:
@@ -652,76 +540,6 @@ def compute_kernel_matrix(
     if kernel_kind == "linear":
         return linear_kernel(other_vecs, train_vecs)
     return rbf_kernel(other_vecs, train_vecs, gamma=resolve_gamma(train_vecs, gamma))
-
-
-def compute_square_kernel_matrix(
-    vecs: np.ndarray,
-    kernel_kind: str,
-    gamma: str | float,
-) -> np.ndarray:
-    if kernel_kind == "linear":
-        return linear_kernel(vecs, vecs)
-    return rbf_kernel(vecs, vecs, gamma=resolve_gamma(vecs, gamma))
-
-
-def label_feature_matrix(labels: np.ndarray, task_type: str) -> np.ndarray:
-    labels = np.asarray(labels)
-    if task_type == "classification":
-        n_classes = int(labels.max()) + 1
-        return np.eye(n_classes, dtype=np.float64)[labels.astype(int)]
-    return labels.astype(np.float64).reshape(-1, 1)
-
-
-def center_gram(kernel: np.ndarray) -> np.ndarray:
-    n = kernel.shape[0]
-    if n == 0:
-        return kernel
-    ones = np.ones((n, n), dtype=np.float64) / n
-    return kernel - ones @ kernel - kernel @ ones + ones @ kernel @ ones
-
-
-def cka_score_from_features(
-    vecs: np.ndarray,
-    labels: np.ndarray,
-    task_type: str,
-    kernel_kind: str,
-    gamma: str | float,
-) -> float:
-    if len(vecs) < 2:
-        return float("nan")
-    x_kernel = center_gram(compute_square_kernel_matrix(np.asarray(vecs, dtype=np.float64), kernel_kind, gamma))
-    y_features = label_feature_matrix(labels, task_type)
-    y_kernel = center_gram(linear_kernel(y_features, y_features))
-    numerator = float(np.sum(x_kernel * y_kernel))
-    denom_x = float(np.linalg.norm(x_kernel, ord="fro"))
-    denom_y = float(np.linalg.norm(y_kernel, ord="fro"))
-    if denom_x <= 0 or denom_y <= 0:
-        return float("nan")
-    return numerator / (denom_x * denom_y)
-
-
-def rsa_score_from_features(
-    vecs: np.ndarray,
-    labels: np.ndarray,
-    task_type: str,
-) -> float:
-    vecs = np.asarray(vecs, dtype=np.float64)
-    labels = np.asarray(labels)
-    if len(vecs) < 3:
-        return float("nan")
-    hidden_dissim = pairwise_distances(vecs, metric="cosine")
-    if task_type == "classification":
-        label_dissim = (labels[:, None] != labels[None, :]).astype(np.float64)
-    else:
-        label_values = labels.astype(np.float64).reshape(-1, 1)
-        label_dissim = pairwise_distances(label_values, metric="euclidean")
-    tri = np.triu_indices_from(hidden_dissim, k=1)
-    hidden_vec = hidden_dissim[tri]
-    label_vec = label_dissim[tri]
-    if np.allclose(hidden_vec.std(), 0.0) or np.allclose(label_vec.std(), 0.0):
-        return float("nan")
-    score = spearmanr(hidden_vec, label_vec, nan_policy="omit").correlation
-    return float(score) if score is not None else float("nan")
 
 
 def safe_pearson(preds: np.ndarray, labels: np.ndarray) -> float:
@@ -812,8 +630,6 @@ def apply_threshold_metrics(
     test_preds: np.ndarray,
     test_binary_labels: np.ndarray | None,
     threshold: float | None,
-    ood_preds: np.ndarray | None = None,
-    ood_binary_labels: np.ndarray | None = None,
 ) -> dict[str, float | int | str]:
     if train_binary_labels is None or val_binary_labels is None or test_binary_labels is None:
         return metrics_row
@@ -835,10 +651,6 @@ def apply_threshold_metrics(
     metrics_row["unseen test threshold_accuracy"] = test_metrics["threshold_accuracy"]
     metrics_row["unseen test threshold_balanced_accuracy"] = test_metrics["threshold_balanced_accuracy"]
 
-    if ood_preds is not None and ood_binary_labels is not None:
-        ood_metrics = compute_threshold_metrics(ood_binary_labels, ood_preds, resolved_threshold)
-        metrics_row["ood test threshold_accuracy"] = ood_metrics["threshold_accuracy"]
-        metrics_row["ood test threshold_balanced_accuracy"] = ood_metrics["threshold_balanced_accuracy"]
     return metrics_row
 
 
@@ -935,38 +747,10 @@ def write_kernel_outputs(
     done_dir: Path,
     metrics_row: dict[str, float | int | str],
     preds_df: pd.DataFrame,
-    ood_preds_df: pd.DataFrame | None = None,
-    ood_metrics: dict[str, float] | None = None,
 ) -> None:
     done_dir.mkdir(parents=True, exist_ok=True)
     pd.DataFrame([metrics_row]).to_csv(done_dir / "metrics.csv", index=False)
     preds_df.to_csv(done_dir / "preds.csv")
-    if ood_preds_df is not None:
-        ood_preds_df.to_csv(done_dir / "ood_preds.csv")
-    if ood_metrics is not None:
-        with open(done_dir / "ood_metrics.json", "w", encoding="utf-8") as f:
-            json.dump(ood_metrics, f, indent=2)
-
-
-def build_metric_only_prediction_frame(
-    row_ids: list[int],
-    permutation_type: str,
-    labels: np.ndarray,
-    prefix: str,
-    seen_label: str,
-) -> pd.DataFrame:
-    return pd.DataFrame(
-        {
-            "instance": [
-                str([(f"{prefix}__{permutation_type}__row_{row_id}", 0, 0, len(f"{prefix}__{permutation_type}__row_{row_id}"))])
-                for row_id in row_ids
-            ],
-            "pred": np.nan,
-            "label": np.asarray(labels),
-            "loss": np.nan,
-            "seen": seen_label,
-        }
-    )
 
 
 def run_kernel_layer(
@@ -992,10 +776,6 @@ def run_kernel_layer(
     kernel_gammas: list[str | float],
     binary_eval_labels: np.ndarray | None = None,
     threshold: float | None = None,
-    ood_hidden_states: np.ndarray | None = None,
-    ood_labels: np.ndarray | None = None,
-    ood_row_ids: list[int] | None = None,
-    ood_binary_eval_labels: np.ndarray | None = None,
 ) -> None:
     split = make_fold_arrays(
         hidden_states=hidden_states,
@@ -1009,29 +789,19 @@ def run_kernel_layer(
         test_idx=test_idx,
         dev_fraction=dev_fraction,
         seed=seed,
-        ood_hidden_states=ood_hidden_states,
-        ood_labels=ood_labels,
-        ood_row_ids=ood_row_ids,
     )
-    train_vecs, dev_vecs, test_vecs, ood_vecs = standardize_splits(
+    train_vecs, dev_vecs, test_vecs = standardize_splits(
         split["train_vecs"],
         split["dev_vecs"],
         split["test_vecs"],
-        split["ood_vecs"],
     )
     train_lbls = np.asarray(split["train_lbls"])
     dev_lbls = np.asarray(split["dev_lbls"])
     test_lbls = np.asarray(split["test_lbls"])
     binary_eval_lookup = row_id_label_lookup(row_ids, binary_eval_labels) if binary_eval_labels is not None else None
-    ood_binary_lookup = (
-        row_id_label_lookup(ood_row_ids, ood_binary_eval_labels)
-        if ood_row_ids is not None and ood_binary_eval_labels is not None
-        else None
-    )
     train_binary_labels = lookup_binary_labels(split["train_row_ids"], binary_eval_lookup)
     dev_binary_labels = lookup_binary_labels(split["dev_row_ids"], binary_eval_lookup)
     test_binary_labels = lookup_binary_labels(split["test_row_ids"], binary_eval_lookup)
-    ood_binary_labels = lookup_binary_labels(split["ood_row_ids"], ood_binary_lookup) if split["ood_row_ids"] is not None else None
     hidden_dim = int(train_vecs.shape[1])
     done_dir = expected_done_dir(
         results_dir=results_dir,
@@ -1094,26 +864,6 @@ def run_kernel_layer(
             "kernel_gamma": best_params["gamma"],
             "method": "kernel",
         }
-        ood_preds_df = None
-        ood_metrics = None
-        ood_preds = None
-        if ood_vecs is not None and split["ood_lbls"] is not None and split["ood_row_ids"] is not None:
-            ood_kernel = compute_kernel_matrix(train_vecs, ood_vecs, kernel_kind, best_params["gamma"])
-            ood_preds = model.predict(ood_kernel).astype(np.float64)
-            ood_losses = (ood_preds - np.asarray(split["ood_lbls"], dtype=np.float64)) ** 2
-            ood_preds_df = build_prediction_frame(
-                row_ids=split["ood_row_ids"],
-                permutation_type=permutation_type,
-                preds=ood_preds,
-                labels=np.asarray(split["ood_lbls"]),
-                losses=ood_losses,
-                prefix="ood",
-                seen_label="ood",
-            )
-            ood_metrics = {
-                "ood test error": float(mean_squared_error(split["ood_lbls"], ood_preds)),
-                "ood test pearson": safe_pearson(ood_preds, np.asarray(split["ood_lbls"], dtype=np.float64)),
-            }
         metrics_row = apply_threshold_metrics(
             metrics_row,
             train_preds=train_preds,
@@ -1123,8 +873,6 @@ def run_kernel_layer(
             test_preds=test_preds,
             test_binary_labels=test_binary_labels,
             threshold=threshold,
-            ood_preds=ood_preds,
-            ood_binary_labels=ood_binary_labels,
         )
     else:
         model, best_params, dev_preds = select_best_kernel_classifier(
@@ -1167,162 +915,7 @@ def run_kernel_layer(
             "kernel_gamma": best_params["gamma"],
             "method": "kernel",
         }
-        ood_preds_df = None
-        ood_metrics = None
-        if ood_vecs is not None and split["ood_lbls"] is not None and split["ood_row_ids"] is not None:
-            ood_kernel = compute_kernel_matrix(train_vecs, ood_vecs, kernel_kind, best_params["gamma"])
-            ood_preds = model.predict(ood_kernel).astype(np.int64)
-            ood_losses = (ood_preds != np.asarray(split["ood_lbls"], dtype=np.int64)).astype(np.float64)
-            ood_preds_df = build_prediction_frame(
-                row_ids=split["ood_row_ids"],
-                permutation_type=permutation_type,
-                preds=ood_preds,
-                labels=np.asarray(split["ood_lbls"]),
-                losses=ood_losses,
-                prefix="ood",
-                seen_label="ood",
-            )
-            ood_metrics = {
-                "ood test acc": float(accuracy_score(split["ood_lbls"], ood_preds)),
-                "ood test f1": float(f1_score(split["ood_lbls"], ood_preds, average="macro")),
-            }
-
-    write_kernel_outputs(done_dir, metrics_row, preds_df, ood_preds_df=ood_preds_df, ood_metrics=ood_metrics)
-
-
-def run_similarity_layer(
-    layer_idx: int,
-    hidden_states: np.ndarray,
-    labels: np.ndarray,
-    row_ids: list[int],
-    permutation_type: str,
-    control_task: str,
-    reduced_dim: int,
-    target_col: str,
-    task_type: str,
-    seed: int,
-    fold_idx: int,
-    train_pool_idx: np.ndarray,
-    test_idx: np.ndarray,
-    dev_fraction: float,
-    results_dir: str,
-    model_name: str,
-    method: str,
-    kernel_kind: str,
-    kernel_gammas: list[str | float],
-    ood_hidden_states: np.ndarray | None = None,
-    ood_labels: np.ndarray | None = None,
-    ood_row_ids: list[int] | None = None,
-) -> None:
-    split = make_fold_arrays(
-        hidden_states=hidden_states,
-        labels=labels,
-        row_ids=row_ids,
-        permutation_type=permutation_type,
-        control_task=control_task,
-        reduced_dim=reduced_dim,
-        task_type=task_type,
-        train_pool_idx=train_pool_idx,
-        test_idx=test_idx,
-        dev_fraction=dev_fraction,
-        seed=seed,
-        ood_hidden_states=ood_hidden_states,
-        ood_labels=ood_labels,
-        ood_row_ids=ood_row_ids,
-    )
-    train_vecs, dev_vecs, test_vecs, ood_vecs = standardize_splits(
-        split["train_vecs"],
-        split["dev_vecs"],
-        split["test_vecs"],
-        split["ood_vecs"],
-    )
-    dev_lbls = np.asarray(split["dev_lbls"])
-    test_lbls = np.asarray(split["test_lbls"])
-    done_dir = expected_done_dir(
-        results_dir=results_dir,
-        target_col=target_col,
-        permutation_type=permutation_type,
-        control_task=control_task,
-        layer_idx=layer_idx,
-        model_name=model_name,
-        fold_idx=fold_idx,
-        seed=seed,
-    )
-    print(
-        f"  {permutation_type:>9} | {control_task:>13} | "
-        f"seed={seed} | fold={fold_idx} | layer {layer_idx:03d} | n={len(labels)} | d={train_vecs.shape[1]} | method={method}"
-    )
-
-    if method == "cka":
-        gamma = kernel_gammas[0] if kernel_kind == "rbf" else "scale"
-        dev_score = cka_score_from_features(dev_vecs, dev_lbls, task_type, kernel_kind, gamma)
-        test_score = cka_score_from_features(test_vecs, test_lbls, task_type, kernel_kind, gamma)
-        metrics_row = {
-            "epoch": 0,
-            "step": 0,
-            "full test cka": test_score,
-            "middle test cka": np.nan,
-            "unseen test cka": test_score,
-            "upper test cka": np.nan,
-            "val cka": dev_score,
-            "val_ref": dev_score,
-            "kernel_type": kernel_kind,
-            "kernel_gamma": gamma,
-            "method": "cka",
-        }
-        ood_metrics = None
-        if ood_vecs is not None and split["ood_lbls"] is not None:
-            ood_metrics = {
-                "ood test cka": cka_score_from_features(
-                    ood_vecs,
-                    np.asarray(split["ood_lbls"]),
-                    task_type,
-                    kernel_kind,
-                    gamma,
-                )
-            }
-    else:
-        dev_score = rsa_score_from_features(dev_vecs, dev_lbls, task_type)
-        test_score = rsa_score_from_features(test_vecs, test_lbls, task_type)
-        metrics_row = {
-            "epoch": 0,
-            "step": 0,
-            "full test rsa": test_score,
-            "middle test rsa": np.nan,
-            "unseen test rsa": test_score,
-            "upper test rsa": np.nan,
-            "val rsa": dev_score,
-            "val_ref": dev_score,
-            "method": "rsa",
-        }
-        ood_metrics = None
-        if ood_vecs is not None and split["ood_lbls"] is not None:
-            ood_metrics = {
-                "ood test rsa": rsa_score_from_features(
-                    ood_vecs,
-                    np.asarray(split["ood_lbls"]),
-                    task_type,
-                )
-            }
-
-    preds_df = build_metric_only_prediction_frame(
-        row_ids=split["test_row_ids"],
-        permutation_type=permutation_type,
-        labels=test_lbls,
-        prefix="test",
-        seen_label="unseen",
-    )
-    ood_preds_df = None
-    if split["ood_lbls"] is not None and split["ood_row_ids"] is not None:
-        ood_preds_df = build_metric_only_prediction_frame(
-            row_ids=split["ood_row_ids"],
-            permutation_type=permutation_type,
-            labels=np.asarray(split["ood_lbls"]),
-            prefix="ood",
-            seen_label="ood",
-        )
-
-    write_kernel_outputs(done_dir, metrics_row, preds_df, ood_preds_df=ood_preds_df, ood_metrics=ood_metrics)
+    write_kernel_outputs(done_dir, metrics_row, preds_df)
 
 
 def run_layer(
@@ -1346,12 +939,8 @@ def run_layer(
     model_name: str,
     binary_eval_labels: np.ndarray | None = None,
     threshold: float | None = None,
-    ood_hidden_states: np.ndarray | None = None,
-    ood_labels: np.ndarray | None = None,
-    ood_row_ids: list[int] | None = None,
-    ood_binary_eval_labels: np.ndarray | None = None,
 ) -> None:
-    train_ds, dev_ds, test_ds, ood_ds = make_fold_datasets(
+    train_ds, dev_ds, test_ds = make_fold_datasets(
         hidden_states,
         labels,
         row_ids,
@@ -1363,9 +952,6 @@ def run_layer(
         test_idx=test_idx,
         dev_fraction=dev_fraction,
         seed=seed,
-        ood_hidden_states=ood_hidden_states,
-        ood_labels=ood_labels,
-        ood_row_ids=ood_row_ids,
     )
     hidden_dim = int(np.asarray(train_ds.inputs_encoded[0]).shape[0])
     probe_name = (
@@ -1412,23 +998,12 @@ def run_layer(
 
     if task_type == "regression" and probing_model is not None:
         binary_eval_lookup = row_id_label_lookup(row_ids, binary_eval_labels) if binary_eval_labels is not None else None
-        ood_binary_lookup = (
-            row_id_label_lookup(ood_row_ids, ood_binary_eval_labels)
-            if ood_row_ids is not None and ood_binary_eval_labels is not None
-            else None
-        )
-        train_preds_df, _ = evaluate_regression_dataset(probing_model, train_ds)
-        dev_preds_df, _ = evaluate_regression_dataset(probing_model, dev_ds)
-        test_preds_df, _ = evaluate_regression_dataset(probing_model, test_ds)
+        train_preds_df = evaluate_regression_dataset(probing_model, train_ds)
+        dev_preds_df = evaluate_regression_dataset(probing_model, dev_ds)
+        test_preds_df = evaluate_regression_dataset(probing_model, test_ds)
         train_binary_labels = lookup_binary_labels(dataset_row_ids(train_ds), binary_eval_lookup)
         dev_binary_labels = lookup_binary_labels(dataset_row_ids(dev_ds), binary_eval_lookup)
         test_binary_labels = lookup_binary_labels(dataset_row_ids(test_ds), binary_eval_lookup)
-        ood_preds = None
-        ood_binary_labels = None
-        if ood_ds is not None:
-            ood_preds_df_threshold, _ = evaluate_regression_dataset(probing_model, ood_ds)
-            ood_preds = ood_preds_df_threshold["pred"].to_numpy(dtype=np.float64)
-            ood_binary_labels = lookup_binary_labels(dataset_row_ids(ood_ds), ood_binary_lookup)
         metrics_path = Path(result_log_dir) / "metrics.csv"
         if metrics_path.exists():
             metrics_df = pd.read_csv(metrics_path)
@@ -1443,8 +1018,6 @@ def run_layer(
                     test_preds=test_preds_df["pred"].to_numpy(dtype=np.float64),
                     test_binary_labels=test_binary_labels,
                     threshold=threshold,
-                    ood_preds=ood_preds,
-                    ood_binary_labels=ood_binary_labels,
                 )
                 for column in updated_row:
                     if column not in metrics_df.columns:
@@ -1452,23 +1025,10 @@ def run_layer(
                 metrics_df.iloc[-1] = pd.Series(updated_row)
                 metrics_df.to_csv(metrics_path, index=False)
 
-    if ood_ds is not None and probing_model is not None:
-        ood_preds, ood_metrics = evaluate_dataset(probing_model, ood_ds, task_type)
-        ood_preds.to_csv(f"{result_log_dir}/ood_preds.csv")
-        with open(f"{result_log_dir}/ood_metrics.json", "w", encoding="utf-8") as f:
-            json.dump(ood_metrics, f, indent=2)
-
 
 def run_probe_task(task: dict) -> dict:
     layer_states = np.load(task["internals_dir"] / task["layer_file"])
     subset_states = layer_states[task["subset_indices"]]
-
-    ood_layer_states = ood_labels = ood_row_ids = None
-    if task["ood_internals_dir"] is not None and task["ood_indices"] is not None and len(task["ood_indices"]) > 0:
-        full_ood_states = np.load(task["ood_internals_dir"] / task["layer_file"])
-        ood_layer_states = full_ood_states[task["ood_indices"]]
-        ood_labels = task["ood_labels"]
-        ood_row_ids = task["ood_row_ids"]
 
     if task["method"] == "kernel":
         run_kernel_layer(
@@ -1494,35 +1054,6 @@ def run_probe_task(task: dict) -> dict:
             kernel_gammas=task["kernel_gammas"],
             binary_eval_labels=task["binary_eval_labels"],
             threshold=task["threshold"],
-            ood_hidden_states=ood_layer_states,
-            ood_labels=ood_labels,
-            ood_row_ids=ood_row_ids,
-            ood_binary_eval_labels=task["ood_binary_eval_labels"],
-        )
-    elif task["method"] in {"cka", "rsa"}:
-        run_similarity_layer(
-            layer_idx=task["layer_idx"],
-            hidden_states=subset_states,
-            labels=task["labels"],
-            row_ids=task["row_ids"],
-            permutation_type=task["permutation_type"],
-            control_task=task["control_task"],
-            reduced_dim=task["reduced_dim"],
-            target_col=task["target_col"],
-            task_type=task["task_type"],
-            seed=task["seed"],
-            fold_idx=task["fold_idx"],
-            train_pool_idx=task["train_pool_idx"],
-            test_idx=task["test_idx"],
-            dev_fraction=task["dev_fraction"],
-            results_dir=task["results_dir"],
-            model_name=task["model_name"],
-            method=task["method"],
-            kernel_kind=task["kernel"],
-            kernel_gammas=task["kernel_gammas"],
-            ood_hidden_states=ood_layer_states,
-            ood_labels=ood_labels,
-            ood_row_ids=ood_row_ids,
         )
     else:
         run_layer(
@@ -1546,10 +1077,6 @@ def run_probe_task(task: dict) -> dict:
             model_name=task["model_name"],
             binary_eval_labels=task["binary_eval_labels"],
             threshold=task["threshold"],
-            ood_hidden_states=ood_layer_states,
-            ood_labels=ood_labels,
-            ood_row_ids=ood_row_ids,
-            ood_binary_eval_labels=task["ood_binary_eval_labels"],
         )
     return {
         "permutation_type": task["permutation_type"],
@@ -1575,16 +1102,6 @@ def main() -> None:
             f"Target column {args.target_col!r} not found in {internals_dir / 'metadata.csv'}"
         )
     n_layers = len(layer_files)
-    ood_metadata = None
-    if args.ood_internals_dir:
-        ood_metadata, ood_layer_files = load_internals(Path(args.ood_internals_dir))
-        if layer_files != ood_layer_files:
-            raise ValueError("OOD internals dir must contain the same layer_XXX.npy files as the main internals dir")
-        if args.target_col not in ood_metadata.columns:
-            raise ValueError(
-                f"Target column {args.target_col!r} not found in {Path(args.ood_internals_dir) / 'metadata.csv'}"
-            )
-
     task_type = infer_task_type(metadata[args.target_col])
     binary_eval_col = args.binary_eval_col.strip()
     use_binary_eval = False
@@ -1593,34 +1110,19 @@ def main() -> None:
             use_binary_eval = True
             metadata = metadata[metadata[binary_eval_col].notna()].copy()
             metadata[binary_eval_col] = metadata[binary_eval_col].astype(bool)
-            if ood_metadata is not None and binary_eval_col in ood_metadata.columns:
-                ood_metadata = ood_metadata[ood_metadata[binary_eval_col].notna()].copy()
-                ood_metadata[binary_eval_col] = ood_metadata[binary_eval_col].astype(bool)
-            elif ood_metadata is not None:
-                raise ValueError(
-                    f"Binary eval column {binary_eval_col!r} not found in {Path(args.ood_internals_dir) / 'metadata.csv'}"
-                )
         else:
             print(f"Binary eval column {binary_eval_col!r} not found; threshold metrics disabled.")
 
     if task_type == "regression":
         metadata[args.target_col] = metadata[args.target_col].astype(float)
-        if ood_metadata is not None:
-            ood_metadata[args.target_col] = ood_metadata[args.target_col].astype(float)
         num_labels = 1
     else:
         metadata = metadata[metadata[args.target_col].notna()].copy()
         metadata[args.target_col] = metadata[args.target_col].astype(int)
-        if ood_metadata is not None:
-            ood_metadata = ood_metadata[ood_metadata[args.target_col].notna()].copy()
-            ood_metadata[args.target_col] = ood_metadata[args.target_col].astype(int)
         unique_labels = sorted(metadata[args.target_col].unique().tolist())
         if unique_labels != list(range(len(unique_labels))):
             label_map = {label: idx for idx, label in enumerate(unique_labels)}
             metadata[args.target_col] = metadata[args.target_col].map(label_map).astype(int)
-            if ood_metadata is not None:
-                ood_metadata = ood_metadata[ood_metadata[args.target_col].isin(label_map)].copy()
-                ood_metadata[args.target_col] = ood_metadata[args.target_col].map(label_map).astype(int)
         num_labels = int(metadata[args.target_col].nunique())
         if num_labels < 2:
             raise ValueError(f"Classification target {args.target_col!r} has fewer than 2 classes.")
@@ -1642,9 +1144,6 @@ def main() -> None:
         labels = subset[args.target_col].to_numpy(dtype=np.float32 if task_type == "regression" else np.int64)
         binary_eval_labels = subset[binary_eval_col].to_numpy(dtype=bool) if use_binary_eval else None
         subset_indices = subset["row_id"].to_numpy(dtype=int)
-        ood_subset = None
-        if ood_metadata is not None:
-            ood_subset = ood_metadata[ood_metadata["permutation_type"] == permutation_type].reset_index(drop=True)
 
         print(f"\nPermutation type: {permutation_type} | rows={len(subset)}")
         if len(subset) < args.num_folds:
@@ -1665,16 +1164,6 @@ def main() -> None:
 
         for layer_file in layer_files:
             layer_idx = int(layer_file.replace("layer_", "").replace(".npy", ""))
-            ood_indices = ood_labels = ood_row_ids = None
-            if ood_subset is not None and not ood_subset.empty:
-                ood_indices = ood_subset["row_id"].to_numpy(dtype=int)
-                ood_labels = ood_subset[args.target_col].to_numpy(
-                    dtype=np.float32 if task_type == "regression" else np.int64
-                )
-                ood_row_ids = ood_subset["row_id"].astype(int).tolist()
-                ood_binary_eval_labels = ood_subset[binary_eval_col].to_numpy(dtype=bool) if use_binary_eval else None
-            else:
-                ood_binary_eval_labels = None
 
             for seed in seeds:
                 if task_type == "classification":
@@ -1700,7 +1189,6 @@ def main() -> None:
                         tasks.append(
                             {
                                 "internals_dir": internals_dir,
-                                "ood_internals_dir": Path(args.ood_internals_dir) if args.ood_internals_dir else None,
                                 "layer_file": layer_file,
                                 "layer_idx": layer_idx,
                                 "subset_indices": subset_indices,
@@ -1727,10 +1215,6 @@ def main() -> None:
                                 "n_total_layers": n_layers,
                                 "results_dir": args.results_dir,
                                 "model_name": args.model_name,
-                                "ood_indices": ood_indices,
-                                "ood_labels": ood_labels,
-                                "ood_row_ids": ood_row_ids,
-                                "ood_binary_eval_labels": ood_binary_eval_labels,
                             }
                         )
 

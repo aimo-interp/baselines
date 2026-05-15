@@ -43,8 +43,6 @@ else
   python -m pip install torch torchvision torchaudio
 fi
 
-python -m pip install 'lamina[hf] @ git+https://github.com/tresiwald/lamina.git'
-
 if [[ "$INSTALL_KERNEL" == "1" ]]; then
   python -m ipykernel install --user --name "$KERNEL_NAME" --display-name "$KERNEL_DISPLAY_NAME"
 fi

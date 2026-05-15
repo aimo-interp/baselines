@@ -42,7 +42,7 @@ CONTROL_LABELS = {
 }
 DEFAULT_CONTROLS = ["NONE", "RANDOMIZATION"]
 METHOD_ORDER = ["probe", "kernel", "cka", "rsa"]
-ORIGIN_ORDER = ["input_last_token", "last_thinking_token", "output_last_token", "average_output"]
+ORIGIN_ORDER = ["input_last_token"]
 METRICS = [
     ("full test pearson", "Pearson correlation", "pearson", False),
     ("full test error", "Test error", "error", True),
@@ -79,7 +79,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--origin",
         default="",
-        help="Optional hidden-state origin filter, e.g. input_last_token or last_thinking_token.",
+        help="Optional hidden-state origin filter. Default and supported origin is input_last_token.",
     )
     return parser.parse_args()
 

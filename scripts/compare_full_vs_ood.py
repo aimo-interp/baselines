@@ -27,7 +27,7 @@ PROBE_RE = re.compile(
     r"^(?:eval-adoption-)?(?P<target>.+?)__(?P<perturbation>[^_][^_]*)__(?P<control_in_probe>none|randomization|permutation)__L(?P<layer>\d{3})$",
     re.IGNORECASE,
 )
-ORIGIN_ORDER = ["input_last_token", "last_thinking_token", "output_last_token", "average_output"]
+ORIGIN_ORDER = ["input_last_token"]
 REDUCTION_ORDER = ["full", "pca10", "pca50"]
 SCOPE_STYLES = {
     "full": {"color": "#1f77b4", "label": "Full test"},

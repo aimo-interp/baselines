@@ -6,9 +6,6 @@ numpy>=1.21
 pandas>=2.0
 scikit-learn>=1.3
 
-# lamina — layer-wise internal representation extraction
-# pip install git+https://github.com/tresiwald/lamina.git[hf]
-
 # holmes-evaluation (probe_only branch) — clone manually:
 #   git clone --branch probe_only https://github.com/Holmes-Benchmark/holmes-evaluation.git
 # Then install its dependencies:

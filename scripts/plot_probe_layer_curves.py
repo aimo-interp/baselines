@@ -11,8 +11,7 @@ runs per layer, then renders:
 Each figure is arranged as:
 - rows: perturbation types
 - columns: either reduction settings (`full`, `pca10`, `pca50`) or hidden-state
-  origins (`input_last_token`, `last_thinking_token`, `output_last_token`,
-  `average_output`)
+  origins (currently `input_last_token`)
 
 Within each subplot:
 - blue line: `NONE`
@@ -47,7 +46,7 @@ CONTROL_LABELS = {
 }
 DEFAULT_CONTROLS = ["NONE", "RANDOMIZATION"]
 REDUCTION_ORDER = ["full", "pca10", "pca50"]
-ORIGIN_ORDER = ["input_last_token", "last_thinking_token", "output_last_token", "average_output"]
+ORIGIN_ORDER = ["input_last_token"]
 def metric_specs(scope: str) -> tuple[list[tuple[str, str, str]], list[tuple[str, str, str]]]:
     if scope == "ood":
         return (
