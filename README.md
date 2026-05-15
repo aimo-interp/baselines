@@ -1,17 +1,39 @@
-# AIMO Baseline
+<h1 align="center">AIMO Interpretability Challenge - Baselines</h1>
 
-This repo contains a minimal eval-adoption workflow:
+<div style="text-align: center; width: 100%;">
+  <div style="display: inline-block; text-align: left; width: 100%;">
+    <img src="assets/imgs/aimo_interp_challenge.png" style="width: 100%;" alt="Challenge theme">
+    <p style="color: gray; font-size: small; margin: 0;">
+    </p>
+  </div>
+</div>
 
-- [scripts/encode.py](/Users/tresi/Projects/AIMO-baseline/scripts/encode.py): extract last-input-token hidden states from a dataset CSV
-- [scripts/probe.py](/Users/tresi/Projects/AIMO-baseline/scripts/probe.py): run layer-wise `probe` or `kernel` experiments on those hidden states
-- [run_encoding.bash](/Users/tresi/Projects/AIMO-baseline/run_encoding.bash): repo-root wrapper for encoding
-- [run_probing.bash](/Users/tresi/Projects/AIMO-baseline/run_probing.bash): repo-root wrapper for probing
+<br>
 
-The old mockup pipeline and the multi-view generation-based extraction flow have been removed.
+This repository contains baselines for the AIMO Interpretability Challenge 2026.
+
+*The AIMO Interpretability Challenge is a competition on distinguishing robust from spurious reasoning in frontier mathematical language models. The challenge is motivated by a central limitation of standard reasoning benchmarks: strong final-answer accuracy does not reveal whether a model genuinely relies on stable reasoning mechanisms or exploits brittle shortcuts. Building on the AI Mathematical Olympiad (AIMO) submissions and the Fields Model Initiative’s resources, the competition will provide (1) olympiad-level math problems, (2) their symbolic representations allowing generation of counterfactual variants, (3) access to best-performing AIMO models, and (4) a generous compute of up to 128 H200 GPUs. Based on these, participants will develop methods that identify which model is robust, using models’ internal representations. Our competition will also create a new, open robustness benchmark and baseline systems, aiming to provide a lasting infrastructure for standard benchmarking in interpretability. Scientifically, the competition bridges the gap between the fields of interpretability and generalization by aligning their objectives, while lastingly supporting work aiming to answer the pertaining question in AI research: can we tell if, and to what extent, is the decision making of frontier AI models generalizable, and thus, reliable?*
+
+The current codebase focuses on a minimal representation-based workflow:
+
+- encode the last input-token hidden state from every transformer layer
+- predict `absolute_accuracy_decay` from those layer representations
+- compare linear probing and kernel baselines
+
+## Table of Contents
+- [Table of Contents](#table-of-contents)
+- [Setup](#setup)
+- [Representation Encoding](#representation-encoding)
+- [Layer-wise Prediction](#layer-wise-prediction)
+- [Plotting](#plotting)
+- [License](#license)
+- [Citation](#citation)
 
 ## Setup
 
-Preferred:
+All code was developed and tested in a Python virtual environment with the dependencies listed in [requirements.txt](/Users/tresi/Projects/AIMO-baseline/requirements.txt).
+
+For a server-style setup, use:
 
 ```bash
 bash scripts/setup_server.sh
@@ -23,8 +45,7 @@ Manual setup:
 python3 -m venv .venv-jlab
 source .venv-jlab/bin/activate
 pip install --upgrade pip setuptools wheel
-pip install pandas numpy pyarrow scipy scikit-learn matplotlib datasets huggingface_hub ipykernel jupyterlab pytorch-lightning retry transformers
-pip install torch torchvision torchaudio
+pip install -r requirements.txt
 ```
 
 If `holmes-evaluation` is missing:
@@ -33,84 +54,54 @@ If `holmes-evaluation` is missing:
 git clone --branch probe_only https://github.com/Holmes-Benchmark/holmes-evaluation.git
 ```
 
-## Expected CSV Columns
+## Representation Encoding
 
-Required:
+The encoding stage performs a single forward pass per unique prompt and extracts only the final input-token hidden state from every layer. Duplicate prompts are encoded once and then expanded back to the full dataset rows.
+
+Expected CSV columns:
 
 - `problem_id`
 - `original_problem`
 - `permutation_type`
 - `absolute_accuracy_decay`
 
-Preserved in `metadata.csv` when present:
-
-- `model_id`
-- `dataset_id`
-- `model_is_robust`
-
-## Quickstart
-
-Encode:
-
-```bash
-bash run_encoding.bash
-```
-
-Probe:
-
-```bash
-bash run_probing.bash
-```
-
-Useful overrides:
-
-```bash
-DATASET_CSV=dataset_as_table_filtered.csv \
-OUTPUT_DIR=data/eval_adoption_internals_table_filtered \
-bash run_encoding.bash
-```
-
-```bash
-INTERNALS_ROOT=data/eval_adoption_internals_table_filtered \
-MODEL_NAME=deepseek-r1-0528-qwen3-8b \
-TARGET_COL=absolute_accuracy_decay \
-METHODS=probe,kernel \
-bash run_probing.bash
-```
-
-## Encoding
-
-The encoder performs a single forward pass per unique prompt and extracts only the final input-token hidden state from every layer.
-
-Direct invocation:
+Direct run:
 
 ```bash
 python scripts/encode.py \
-  --dataset-csv dataset_as_table_filtered.csv \
+  --dataset-csv data/math-robust-agg.csv \
   --model-id deepseek-ai/DeepSeek-R1-0528-Qwen3-8B \
   --output-dir data/eval_adoption_internals_table_filtered \
   --device cuda
 ```
 
-Output layout:
+Wrapper:
+
+```bash
+bash run_encoding.bash
+```
+
+Example override:
+
+```bash
+DATASET_CSV=data/math-robust-agg.csv \
+OUTPUT_DIR=data/eval_adoption_internals_table_filtered \
+bash run_encoding.bash
+```
+
+The output directory contains:
 
 - `metadata.csv`
 - `layer_000.npy`
 - `layer_001.npy`
 - ...
 
-Notes:
+## Layer-wise Prediction
 
-- duplicate prompts are encoded once and reused
-- there is no generation step
-- only `input_last_token` is supported
+The probing stage runs repeated cross-validation over layers and perturbation types using two methods:
 
-## Probing
-
-Supported methods:
-
-- `probe`
-- `kernel`
+- `probe`: linear predictive baseline
+- `kernel`: kernel baseline
 
 Default sweep settings:
 
@@ -142,13 +133,23 @@ python scripts/probe.py \
   --kernel rbf
 ```
 
-The probe runner skips already completed runs individually when the corresponding `done/metrics.csv` already exists.
+Wrapper:
 
-## PCA
+```bash
+bash run_probing.bash
+```
 
-PCA is optional and applied per split using only the training pool for fitting.
+Example override:
 
-Example:
+```bash
+INTERNALS_ROOT=data/eval_adoption_internals_table_filtered \
+MODEL_NAME=deepseek-r1-0528-qwen3-8b \
+TARGET_COL=absolute_accuracy_decay \
+METHODS=probe,kernel \
+bash run_probing.bash
+```
+
+PCA is optional and fit only on the training pool of each split:
 
 ```bash
 python scripts/probe.py \
@@ -160,11 +161,7 @@ python scripts/probe.py \
   --reduced-dim 10
 ```
 
-Disable PCA with:
-
-```bash
---reduced-dim 0
-```
+The runner skips already completed tasks individually whenever the corresponding `done/metrics.csv` already exists.
 
 ## Plotting
 
@@ -201,7 +198,10 @@ MPLCONFIGDIR=/tmp/mpl python scripts/plot_method_comparison.py \
   --output-dir plots/method_comparison
 ```
 
-## Notes
+## License
 
-- generated data under `data/`, `results/`, `logs/`, and `plots/` is not meant to be committed by default
-- local macOS semaphore limits may make high-worker runs fail; servers are the intended execution target for large sweeps
+No standalone license file is currently included in this repository. Confirm licensing before redistribution or external reuse.
+
+## Citation
+
+No citation metadata is currently included in this repository. If you need a formal citation block, add it together with the corresponding paper, report, or project page.

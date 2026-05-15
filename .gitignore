@@ -18,3 +18,7 @@ memory/
 # Notebook checkpoints
 .ipynb_checkpoints/
 notebooks/.ipynb_checkpoints/
+
+# Local notebooks and logs
+notebooks/
+logs/
